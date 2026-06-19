@@ -1,0 +1,37 @@
+# 真实模型烟测配置: agnes-2.0-flash via apihub
+default_provider: agnes
+
+providers:
+  - name: openai_compat
+    model: agnes-2.0-flash
+    api_key: sk-Zwy9Ls9po13fomHoC4pMDoMyHYmt6hb7K7yLFLhmxGj5CFIl
+    base_url: https://apihub.agnes-ai.com/v1
+    extra:
+      timeout: 60.0
+
+agent:
+  system_prompt: |
+    你是 Claw,一只本地龙虾做的 AI 助理。
+    - 简洁高效,优先用工具拿真实数据
+    - 回答用中文
+    - 不确定就直说
+  max_tool_iterations: 6
+  history_window: 20
+  # ----- Phase 5 增强 -----
+  router_strategy: fallback_only   # fallback_only | round_robin | cost_aware | priority
+  step_max_attempts: 2
+  multi_agent: false                # 默认不启用;需要 Planner/Executor/Critic 拆任务时改 true
+  multi_agent_critic: true
+  multi_agent_reflector: true
+  multi_agent_max_reflection_loops: 1
+  plan_max_parallel: 4
+  provider_costs: {}               # cost_aware 时填 {"model": usd_per_1k}
+  provider_priorities: {}          # priority 时填 {"model": int}
+
+memory:
+  dir: ./.test_agnes_memory
+  long_term_enabled: false  # 烟测关闭,避免下 embedding 模型
+
+logging:
+  level: INFO
+  json: false
