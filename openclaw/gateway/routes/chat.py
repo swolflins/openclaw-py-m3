@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from openclaw.gateway import metrics as m
 from openclaw.gateway.deps import get_deps
 from openclaw.gateway.util import to_jsonable
 
@@ -35,11 +37,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if not deps.ready() or deps.agent_loop is None:
         raise HTTPException(503, "agent_loop not attached;configure providers first")
     loop = deps.agent_loop
-    import time
     t0 = time.time()
+    m.chat_total.inc(session_id=req.session_id)
     try:
         resp = await loop.handle(req.session_id, req.message)
     except Exception as e:
+        m.chat_errors_total.inc(error_type=type(e).__name__)
         raise HTTPException(500, f"agent error: {type(e).__name__}: {e}") from e
     return ChatResponse(
         session_id=req.session_id,

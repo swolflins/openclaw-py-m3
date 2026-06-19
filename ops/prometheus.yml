@@ -1,0 +1,27 @@
+# Prometheus 抓取配置 — openclaw-py
+#
+# 用法:已经在 docker-compose.yml 挂载到 /etc/prometheus/prometheus.yml
+# 单机/本地直接 `prometheus --config.file=ops/prometheus.yml`
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: openclaw-monitor
+    project: openclaw-py
+
+scrape_configs:
+  - job_name: openclaw-gateway
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - gateway:8080
+        labels:
+          service: gateway
+          tier: app
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

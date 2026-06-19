@@ -36,6 +36,7 @@ openclaw_py/
 │   ├── memory/           # short_term / long_term / soul / workspace / scoped
 │   ├── channels/         # CLI / 飞书 / Telegram / Discord / Slack / WhatsApp / Signal / iMessage
 │   ├── gateway/          # FastAPI REST + Web UI (Phase 8)
+│   ├── gateway/metrics.py  # Prometheus 文本格式指标(Phase 9)
 │   ├── config/           # 旧 .env Pydantic Settings(兼容)
 │   └── cli.py            # Typer 入口
 ├── examples/
@@ -45,8 +46,15 @@ openclaw_py/
 │   ├── phase5_smoke.py       # Plan-Execute / Multi-Agent / Router 端到端
 │   ├── phase6_smoke.py       # Auto-Reply + Skills 端到端
 │   ├── phase7_smoke.py       # 多渠道入站 + ChannelManager + 真 LLM 端到端
-│   └── phase8_smoke.py       # 启 uvicorn + curl 25 条端到端
-├── tests/                 # 164 个测试
+│   ├── phase8_smoke.py       # 启 uvicorn + curl 25 条端到端
+│   └── phase9_smoke.py       # Dockerfile/compose/prom 静态 + Prometheus 抓取 15 条
+├── tests/                 # 189 个测试
+├── Dockerfile             # 多阶段构建(Phase 9)
+├── docker-compose.yml     # gateway + redis + ollama + prometheus(Phase 9)
+├── .dockerignore
+├── ops/prometheus.yml     # Prometheus 抓取配置(Phase 9)
+├── .github/workflows/ci.yml   # GitHub Actions:ruff + pytest + docker build(Phase 9)
+├── Makefile               # make dev/test/serve/docker/lint/clean(Phase 9)
 ├── pyproject.toml
 ├── .env.example
 └── README.md
@@ -516,14 +524,85 @@ my_plugin = "my_plugin:register"
 | Phase 6:Auto-Reply + Skills(L5) | ✅ | 模板/限流/黑名单 + SKILL.md 目录加载(工具 + prompt 注入) |
 | Phase 7:多渠道(L6) | ✅ | CLI / 飞书 / Telegram / Discord / Slack / WhatsApp / Signal / iMessage(112 测试) |
 | Phase 8:Gateway(L7) | ✅ | FastAPI REST + Web UI(单页:侧栏 session + 聊天 + 工具 / skills 抽屉)— 164 测试 |
+| Phase 9:生产化(L8) | ✅ | Dockerfile(多阶段 + non-root + healthcheck)+ docker-compose(gateway + redis + ollama + prometheus)+ Prometheus 文本格式 metrics + GitHub Actions CI(Python 3.10/3.11/3.12 matrix)+ Makefile — 189 测试 |
 
-## 开发
+## 开发 & 部署(Phase 9)
+
+### 本地开发(Makefile)
 
 ```bash
-pip install -e ".[dev,all]"
-ruff check .
-pytest -q
+make help        # 列出所有目标
+make dev         # 装全部依赖(开发 + all)
+make test        # 跑测试
+make lint        # ruff check
+make fmt         # ruff 自动 fix
+make serve       # 启 gateway(http://127.0.0.1:8080/ui/)
+make smoke       # 跑全部 phase 烟测
+make clean       # 清缓存
 ```
+
+### Docker(生产化)
+
+多阶段构建,目标 < 300MB:
+```bash
+docker build -t openclaw-py:dev .    # 构镜像
+docker run -d --rm -p 8080:8080 \
+  -e OPENAI_API_KEY=sk-... \
+  -v openclaw-data:/data \
+  --name openclaw openclaw-py:dev
+
+# /healthz / /ui/ / /metrics / /docs
+```
+
+docker-compose 一键起全部依赖(gateway + redis + ollama + prometheus):
+```bash
+cp .env.example .env  # 填 LLM key
+docker compose up -d --build
+# 等待 healthcheck 通过(curl http://127.0.0.1:8080/healthz)
+docker compose logs -f gateway
+docker compose down -v
+```
+
+镜像特性:
+- `python:3.11-slim` 基础镜像
+- `tini` 做 PID 1 信号转发
+- non-root user(openclaw uid 1000)
+- `HEALTHCHECK --interval=15s` 走 `/healthz`
+- `VOLUME /data` 持久化 SOUL / 长期记忆 / sqlite
+- `ENV` 全部走 `OPENCLAW_*` 前缀(config 走 Pydantic 读)
+
+### Prometheus 抓取
+
+`/metrics` 双格式:
+- `Accept: text/plain` → Prometheus 文本(0 依赖)
+- `Accept: application/json` → JSON(给人类看)
+
+```
+$ curl -H 'Accept: text/plain' http://127.0.0.1:8080/metrics
+# HELP openclaw_uptime_seconds Gateway 启动后经过的秒数
+# TYPE openclaw_uptime_seconds gauge
+openclaw_uptime_seconds 142.31
+# HELP openclaw_chat_total Chat 调用总数
+# TYPE openclaw_chat_total counter
+openclaw_chat_total{session_id="u1"} 7
+openclaw_chat_total{session_id="u2"} 3
+# HELP openclaw_tool_calls_total 工具调用总数
+# TYPE openclaw_tool_calls_total counter
+openclaw_tool_calls_total{tool="get_time",approved="true"} 5
+openclaw_tool_calls_total{tool="shell_exec",approved="false"} 1
+# HELP openclaw_chat_errors_total Chat 错误总数
+# TYPE openclaw_chat_errors_total counter
+openclaw_chat_errors_total{error_type="ValueError"} 0
+```
+
+自带的 `ops/prometheus.yml` 抓 `gateway:8080/metrics`,compose 起来后:
+- Prometheus UI: http://127.0.0.1:9090
+- 表达式:`rate(openclaw_chat_total[5m])` / `openclaw_agent_attached == 0`
+
+### CI(`.github/workflows/ci.yml`)
+
+- Job 1 `test`:Python 3.10 / 3.11 / 3.12 matrix → `ruff check .` + `pytest tests/ -v`
+- Job 2 `docker`:只在 main 分支触发,build 镜像到 `ghcr.io/.../openclaw-py:dev` + `:${{ sha }}` + smoke(curl `/healthz`)
 
 ## 许可证
 

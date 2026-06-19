@@ -1,7 +1,9 @@
 """/healthz + /readyz + /metrics + /version。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Header, Response
+
+from openclaw.gateway import metrics as m
 from openclaw.gateway.deps import get_deps
 
 router = APIRouter(tags=["health"])
@@ -31,9 +33,22 @@ async def readyz(response: Response) -> dict:
 
 
 @router.get("/metrics")
-async def metrics() -> dict:
-    """最朴素的指标 JSON(不接 Prometheus 也够监控用)。"""
+async def metrics(
+    response: Response,
+    accept: str | None = Header(default=None),
+) -> Response:
+    """双格式:Prometheus 抓取(Accept: text/plain) → prom 文本,否则 → JSON。
+
+    也更新 gauge(openclaw_uptime_seconds / openclaw_agent_attached)。
+    """
     deps = get_deps()
+    m.uptime_seconds.set(deps.uptime())
+    m.agent_attached.set(1.0 if deps.ready() else 0.0)
+
+    wants_prom = bool(accept and "text/plain" in accept.lower())
+    if wants_prom:
+        return Response(content=m.render_prometheus(), media_type="text/plain; version=0.0.4")
+
     out: dict = {
         "uptime_s": round(deps.uptime(), 2),
         "agent_attached": deps.ready(),

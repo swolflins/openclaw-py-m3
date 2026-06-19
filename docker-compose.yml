@@ -1,0 +1,119 @@
+# docker-compose.yml — 本地一键起 OpenClaw
+#
+# 用法:
+#   docker compose up -d --build   # 启动
+#   curl http://127.0.0.1:8080/healthz
+#   docker compose logs -f gateway
+#   docker compose down -v          # 销毁(带卷)
+#
+# 配置可在 .env 文件里覆盖,例如:
+#   OPENCLAQ_LLM__OPENAI_API_KEY=sk-...
+#   OPENCLAW_LOG_LEVEL=DEBUG
+
+name: openclaw
+
+services:
+  # ─────── 主服务:Gateway ───────
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.11"
+    image: openclaw-py:dev
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - openclaw-data:/data
+      - ./openclaw.agnes.yaml:/app/openclaw.yaml:ro
+      - ./SOUL.md:/app/SOUL.md:ro
+    environment:
+      OPENCLAW_LOG_LEVEL: ${OPENCLAW_LOG_LEVEL:-INFO}
+      OPENCLAW_GATEWAY_HOST: 0.0.0.0
+      OPENCLAW_GATEWAY_PORT: "8080"
+      # LLM 凭据(从 .env 读)
+      OPENCLAW_LLM__OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENCLAW_LLM__ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENCLAW_LLM__GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # 多渠道(可选)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
+      WHATSAPP_PHONE_ID: ${WHATSAPP_PHONE_ID:-}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - openclaw-net
+
+  # ─────── 可选:Redis(给 EventBus / ChannelManager 共用) ───────
+  redis:
+    image: redis:7-alpine
+    container_name: openclaw-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - openclaw-net
+
+  # ─────── 可选:本地 LLM(Ollama,默认 11434) ───────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: openclaw-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+      OLLAMA_HOST: 0.0.0.0:11434
+    networks:
+      - openclaw-net
+
+  # ─────── 可选:Prometheus 抓 metrics ───────
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    container_name: openclaw-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    depends_on:
+      - gateway
+    networks:
+      - openclaw-net
+
+networks:
+  openclaw-net:
+    driver: bridge
+
+volumes:
+  openclaw-data:
+  redis-data:
+  ollama-data:
+  prometheus-data:

@@ -1,0 +1,41 @@
+# .dockerignore — 排除所有不需要进镜像的东西
+.git
+.gitignore
+.github
+.gitattributes
+
+# 测试 / 静态分析
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.pyright_cache
+.coverage
+htmlcov
+tests
+*.log
+
+# 本地数据 / 临时文件
+.test_*
+.openclaw_memory
+.openclaw
+*.sqlite
+*.sqlite3
+
+# 文档(README 已单独 COPY,这个是 source 根)
+docs
+
+# 容器
+Dockerfile
+.dockerignore
+docker-compose*.yml
+.docker/
+
+# venv
+.venv
+venv
+env
+
+# 编辑器
+.vscode
+.idea
+.DS_Store

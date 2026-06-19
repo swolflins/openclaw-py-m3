@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from openclaw.gateway import metrics as m
 from openclaw.gateway.deps import get_deps
 from openclaw.gateway.util import to_jsonable
 
@@ -46,8 +47,10 @@ async def call_tool(req: ToolCallRequest) -> dict:
         raise HTTPException(503, "agent_loop / tools not attached")
     try:
         result = await reg.call(req.name, req.arguments)
+        m.tool_calls_total.inc(tool=req.name, approved="true")
     except PermissionError as e:
         # 危险工具(EXE/ADMIN)需要审批,会抛 PermissionError
+        m.tool_calls_total.inc(tool=req.name, approved="false")
         raise HTTPException(409, f"approval required: {e}") from e
     except KeyError as e:
         raise HTTPException(404, f"tool not found: {e}") from e
