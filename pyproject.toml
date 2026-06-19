@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openclaw-py"
+version = "0.1.0"
+description = "Python reimplementation of OpenClaw: an async AI Agent runtime with multi-channel messaging, tool calling, and persistent memory."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "openclaw-py contributors" }]
+keywords = ["ai", "agent", "llm", "openclaw", "feishu", "lark", "telegram"]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "python-dotenv>=1.0",
+    "rich>=13.7",
+    "typer>=0.12",
+    "aiofiles>=23.2",
+    "lark-oapi>=1.2",
+    "pyyaml>=6.0",
+    "tomli>=2.0; python_version<'3.11'",
+    "watchdog>=4.0",
+    "orjson>=3.10",
+    "tenacity>=8.2",
+    "anthropic>=0.30",
+    "google-generativeai>=0.8",
+    "chromadb>=0.5",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+all = [
+    "playwright>=1.44",
+    "docker>=7.1",
+    "apscheduler>=3.10",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "redis>=5.0",
+]
+
+[project.scripts]
+openclaw = "openclaw.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openclaw*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["examples/*"]

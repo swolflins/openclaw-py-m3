@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 测试 / 静态分析 缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# 本地脏数据 / 临时文件
+.test_*/           # .test_agnes_memory / .test_p7_phase_memory
+.openclaw_memory/
+/.openclaw/
+*.sqlite
+*.sqlite3
+*.log
+*.json
+!examples/skills/**/SKILL.md
+!tests/**/*.json
+
+# 环境
+.env
+.env.local
+.venv/
+venv/
+env/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 阶段 commit 用的临时烟测日志
+/tmp/
+/*.log
