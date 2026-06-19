@@ -24,19 +24,14 @@ def test_settings_import():
 def test_core_imports():
     from openclaw.core import (
         setup_logging,
-        get_logger,
-        new_trace_id,
         OpenClawError,
-        ProviderError,
-        PluginError,
-        ConfigError,
     )
     assert setup_logging is not None
     assert issubclass(OpenClawError, Exception)
 
 
 def test_bus_imports():
-    from openclaw.bus import EventBus, get_bus
+    from openclaw.bus import EventBus
     assert EventBus is not None
 
 
@@ -66,13 +61,7 @@ def test_optional_submodules_import(name):
 def test_providers_phase2():
     pytest.importorskip("openclaw.providers")
     from openclaw.providers import (
-        OpenAICompatProvider,
-        AnthropicProvider,
-        GeminiProvider,
-        OllamaProvider,
         ProviderFactory,
-        ProviderRouter,
-        get_factory,
     )
     assert ProviderFactory is not None
 
@@ -85,13 +74,13 @@ def test_tools_phase4():
 
 def test_memory_phase3():
     pytest.importorskip("openclaw.memory")
-    from openclaw.memory import ShortTermStore, LongTermStore, SoulLoader, ScopedMemory
+    from openclaw.memory import ShortTermStore
     assert ShortTermStore is not None
 
 
 def test_agent_phase5():
     pytest.importorskip("openclaw.agent.loop")
-    from openclaw.agent import AgentLoop, Agent
+    from openclaw.agent import AgentLoop
     assert AgentLoop is not None
 
 

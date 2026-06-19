@@ -35,6 +35,7 @@ openclaw_py/
 │   ├── agent/            # AgentLoop + Plan-Execute + Multi-Agent(已接入 ScopedMemory)
 │   ├── memory/           # short_term / long_term / soul / workspace / scoped
 │   ├── channels/         # CLI / 飞书 / Telegram / Discord / Slack / WhatsApp / Signal / iMessage
+│   ├── gateway/          # FastAPI REST + Web UI (Phase 8)
 │   ├── config/           # 旧 .env Pydantic Settings(兼容)
 │   └── cli.py            # Typer 入口
 ├── examples/
@@ -43,8 +44,9 @@ openclaw_py/
 │   ├── tools_demo.py         # Phase 4 工具全量演示
 │   ├── phase5_smoke.py       # Plan-Execute / Multi-Agent / Router 端到端
 │   ├── phase6_smoke.py       # Auto-Reply + Skills 端到端
-│   └── phase7_smoke.py       # 多渠道入站 + ChannelManager + 真 LLM 端到端
-├── tests/                 # 112 个测试
+│   ├── phase7_smoke.py       # 多渠道入站 + ChannelManager + 真 LLM 端到端
+│   └── phase8_smoke.py       # 启 uvicorn + curl 25 条端到端
+├── tests/                 # 164 个测试
 ├── pyproject.toml
 ├── .env.example
 └── README.md
@@ -410,6 +412,65 @@ mgr.register(TelegramChannel.from_env(agent))  # 从 env 读 TELEGRAM_BOT_TOKEN
 | [3] | EchoChannel 统一管道 — template / blacklist / 白名单 / DM 默认放行 / 限流 | ✅ |
 | [4] | 真 LLM 端到端 — `bot 用 shell_exec 跑 date` → 答出"当前时间" | ✅ |
 
+## Gateway(Phase 8)
+
+FastAPI REST + 单页 Web UI,把所有能力装进 HTTP:
+
+```bash
+pip install fastapi uvicorn sse-starlette
+uvicorn openclaw.gateway.app:app --host 0.0.0.0 --port 8080
+# 打开浏览器 http://127.0.0.1:8080/ui/
+```
+
+### 路由一览(24 个)
+
+| 路径 | 方法 | 用途 |
+|---|---|---|
+| `/healthz` `/readyz` | GET | 存活 / 就绪探针(后者在无 agent_loop 时返 503) |
+| `/metrics` `/version` | GET | 朴素指标 JSON / 版本号 |
+| `/v1/chat` | POST | 单轮对话(返回 content + tool_calls + duration_ms) |
+| `/v1/chat/stream` | POST | SSE 流式:start / thinking / tool_call / delta / done / __end__ |
+| `/v1/sessions` | GET / POST / DELETE | 列出 / 新建 / 清除 |
+| `/v1/sessions/{id}` | GET | 最近 K 条消息 |
+| `/v1/memory/short` | GET / POST / DELETE | 短期记忆读写 / 按 scope 清除 |
+| `/v1/memory/long` | GET / POST | 长期记忆向量召回 / 添加 |
+| `/v1/memory/soul` | GET / POST | 渲染合并后的 SOUL+system_prompt / 重新加载 |
+| `/v1/tools` | GET | 列出所有工具(category / permission) |
+| `/v1/tools/call` | POST | 调用工具(EXE/ADMIN 默认 409 approval required) |
+| `/v1/tools/approver` | POST | 全局切换 "auto approve / deny" |
+| `/v1/skills` | GET | 列出已加载的 skills |
+| `/v1/skills/reload` | POST | 重载 SKILL.md 目录,返回 prompt_injections |
+| `/v1/channels` | GET | 列出 channel 状态 |
+| `/v1/channels/send` | POST | 通过指定 channel 主动发一条 |
+| `/ui/` | GET | 单页 Web UI(session 列表 / 聊天 / 工具抽屉 / skills 抽屉) |
+| `/docs` | GET | FastAPI 自带 OpenAPI 文档 |
+
+### 依赖注入
+
+启动时把 AgentLoop / ChannelManager 装进 `GatewayDeps` 单例,所有路由共享:
+```python
+from openclaw.gateway import deps as deps_mod
+from openclaw.gateway.routes.channels import set_channel_manager
+deps_mod.set_deps(deps_mod.GatewayDeps(agent_loop=loop, config_path=Path("openclaw.yaml")))
+set_channel_manager(channel_manager)  # 暴露 channel 给 /v1/channels
+```
+
+### 烟测
+
+`python examples/phase8_smoke.py`(启 uvicorn 后台 + curl 25 条):
+
+| 段 | 验证点 | 结果 |
+|---|---|---|
+| [1] | /healthz / /readyz / /metrics / /version | ✅ |
+| [2] | /v1/chat echo + SSE event 序列 | ✅ |
+| [3] | /v1/sessions CRUD | ✅ |
+| [4] | /v1/memory/short {GET POST DELETE} | ✅ |
+| [5] | /v1/memory/long {add 2 + recall 命中} | ✅ |
+| [6] | /v1/memory/soul {get 渲染 + reload} | ✅ |
+| [7] | /v1/tools {list + safe call + dangerous 409 + approver 切换} | ✅ |
+| [8] | /v1/channels {list + send} | ✅ |
+| [9] | /ui/ HTML 200 + / 根 JSON | ✅ |
+
 ## 写自己的工具
 
 ```python
@@ -454,7 +515,7 @@ my_plugin = "my_plugin:register"
 | Phase 5:Agent 全量(L4) | ✅ | Plan-Execute DAG + Multi-Agent(Planner/Executor/Critic/Reflector) + Router 四策略 |
 | Phase 6:Auto-Reply + Skills(L5) | ✅ | 模板/限流/黑名单 + SKILL.md 目录加载(工具 + prompt 注入) |
 | Phase 7:多渠道(L6) | ✅ | CLI / 飞书 / Telegram / Discord / Slack / WhatsApp / Signal / iMessage(112 测试) |
-| Phase 8:Gateway(L7) | 🔲 | FastAPI REST + Web UI |
+| Phase 8:Gateway(L7) | ✅ | FastAPI REST + Web UI(单页:侧栏 session + 聊天 + 工具 / skills 抽屉)— 164 测试 |
 
 ## 开发
 
