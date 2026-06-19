@@ -42,6 +42,8 @@ class LarkChannel(BaseChannel):
         self._ws_client: Optional[Any] = None
         self._stopped = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        # session_id → 最近一条 message_id,send() 用它 reply 原消息
+        self._last_msg_id: dict[str, str] = {}
 
     # ---------- 公共接口 ----------
 
@@ -81,15 +83,20 @@ class LarkChannel(BaseChannel):
                 self._task.cancel()
 
     async def send(self, session_id: str, text: str) -> None:
-        """主动给 session_id 发送消息。
-        session_id 格式: 'oc_xxx:chat_id' (p2p) 或 'chat_id' (群)
-        """
+        """主动给 session_id 发送消息(默认 reply 原消息)。"""
         if not self.available:
             logger.warning("Lark 未配置,无法发送消息")
             return
-        # 这里需要根据实际 chat_id / open_chat_id 调用 im/v1/messages 创建
-        # 为了 MVP 简洁,仅记录日志;真实发送由 on_message 内回复流程完成
-        logger.info("[lark -> %s] %s", session_id, text[:200])
+        if not text:
+            return
+        message_id = self._last_msg_id.get(session_id, "")
+        if not message_id:
+            logger.warning(
+                "Lark send 失败:session 没有对应 message_id(可能从 WS 收的消息),"
+                "session=%s text=%r", session_id, text[:60],
+            )
+            return
+        await self._reply_to_lark(message_id, text)
 
     # ---------- 内部实现 ----------
 
@@ -134,6 +141,10 @@ class LarkChannel(BaseChannel):
 
             from openclaw.channels.base import IncomingMessage
             session_id = f"lark:{chat_id}:{open_id}"
+            message_id = getattr(msg, "message_id", "")
+            if message_id:
+                # send() 内部用这个 reply 原消息
+                self._last_msg_id[session_id] = message_id
             # 走统一管道(经过 AutoReply)
             await self.dispatch(IncomingMessage(
                 channel=self.name,
@@ -145,7 +156,7 @@ class LarkChannel(BaseChannel):
                     "is_dm": getattr(msg, "chat_type", "") == "p2p",
                     "mentioned": False,  # 飞书未解析 mentions
                     "chat_id": chat_id,
-                    "message_id": getattr(msg, "message_id", ""),
+                    "message_id": message_id,
                 },
             ))
         except Exception:
@@ -170,7 +181,7 @@ class LarkChannel(BaseChannel):
         return ""
 
     async def _reply_to_lark(self, message_id: str, text: str) -> None:
-        """回复一条飞书消息(用 im/v1/messages create, mention 关联原消息)。"""
+        """回复一条飞书消息(用 im/v1/messages/:id/reply)。"""
         import httpx
 
         if not text:
@@ -178,10 +189,10 @@ class LarkChannel(BaseChannel):
 
         token = await self._get_tenant_token()
         if not token:
+            logger.error("reply 失败:拿不到 tenant_access_token")
             return
 
-        url = "https://open.feishu.cn/open-apis/im/v1/messages"
-        params = {"receive_id_type": "chat_id"}
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply"
         body = {
             "msg_type": "text",
             "content": json.dumps({"text": text}, ensure_ascii=False),
@@ -191,18 +202,26 @@ class LarkChannel(BaseChannel):
             "Content-Type": "application/json; charset=utf-8",
         }
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            # 通过 message_id 反查 chat_id
-            try:
-                # MVP 简化:不查原 chat_id,直接用回复接口
-                await client.post(
-                    f"{url}/{message_id}/reply",
-                    params=params,
-                    json=body,
-                    headers=headers,
-                )
-            except Exception:
-                logger.exception("回复飞书消息失败")
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(url, json=body, headers=headers)
+                ctype = getattr(r, "headers", {}).get("content-type", "")
+                if ctype.startswith("application/json"):
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = {}
+                else:
+                    data = {}
+                if r.status_code != 200 or data.get("code", 0) != 0:
+                    logger.error(
+                        "reply 失败 http=%s code=%s msg=%s body=%s",
+                        r.status_code, data.get("code"), data.get("msg"), data,
+                    )
+                else:
+                    logger.info("reply 成功 message_id=%s len=%d", message_id, len(text))
+        except Exception:
+            logger.exception("回复飞书消息失败")
 
     async def _get_tenant_token(self) -> str | None:
         import httpx

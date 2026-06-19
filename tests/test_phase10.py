@@ -231,3 +231,117 @@ def test_render_report_abort(stub_httpx):
     report = asyncio.run(probe_all("cli_x", "bad"))
     out = render_report(report)
     assert "凭据不可用" in out
+
+
+# ─────── LarkChannel.send → reply 路径 ───────
+
+class _FakeAgent:
+    """极简 agent,AgentLoop 接口 stub。"""
+
+    async def handle(self, session_id, text, **kw):
+        class R:
+            content = f"echo:{text}"
+            tool_calls = []
+            iterations = 1
+        return R()
+
+    async def new_session(self, sid=None):
+        return sid or "s"
+
+    @property
+    def tools(self): return None
+
+    @property
+    def memory(self): return None
+
+    @property
+    def auto_reply(self): return None
+
+
+def test_lark_channel_send_uses_cached_message_id(monkeypatch):
+    """LarkChannel.send 应从 _last_msg_id 取 message_id 调 reply 接口。"""
+    from openclaw.channels.lark import LarkChannel
+    from openclaw.config.settings import LarkSettings
+
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self_inner):
+            return {"code": 0, "msg": "success", "data": {"message_id": "om_new"}}
+
+    async def _post(self_inner, url, json=None, headers=None, **kw):
+        captured["url"] = url
+        captured["body"] = json
+        captured["headers"] = headers
+        return _Resp()
+
+    async def _noop(*a, **kw):
+        return None
+
+    # tenant token stub
+    async def _tok(self_inner):
+        return "t-abc"
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    monkeypatch.setattr(LarkChannel, "_get_tenant_token", _tok)
+
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch._last_msg_id["lark:oc_c1:ou_u1"] = "om_orig"
+    asyncio.run(ch.send("lark:oc_c1:ou_u1", "你好"))
+    assert "/im/v1/messages/om_orig/reply" in captured["url"]
+    assert "你好" in captured["body"]["content"]
+
+
+def test_lark_channel_send_no_message_id_warns(monkeypatch, caplog):
+    """session 没 message_id → send 应只 warn 不抛、不发。"""
+    from openclaw.channels.lark import LarkChannel
+    from openclaw.config.settings import LarkSettings
+
+    sent: dict = {}
+
+    async def _post(self_inner, url, **kw):
+        sent["hit"] = True
+        class R:
+            status_code = 200
+            def json(self_inner): return {}
+        return R()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    # 没 _last_msg_id[session] → 应不发
+    import logging
+    caplog.set_level(logging.WARNING)
+    asyncio.run(ch.send("lark:oc_unknown:ou_x", "ping"))
+    assert "hit" not in sent
+    assert any("message_id" in r.message for r in caplog.records)
+
+
+def test_lark_channel_reply_logs_failure(monkeypatch, caplog):
+    """reply 失败 → 记录 http/code, 不抛。"""
+    from openclaw.channels.lark import LarkChannel
+    from openclaw.config.settings import LarkSettings
+    import logging
+
+    class _Resp:
+        status_code = 400
+        headers = {"content-type": "application/json"}
+        def json(self_inner):
+            return {"code": 230013, "msg": "Bot has NO availability"}
+
+    async def _post(self_inner, url, **kw):
+        return _Resp()
+
+    async def _tok(self_inner):
+        return "t-1"
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    monkeypatch.setattr(LarkChannel, "_get_tenant_token", _tok)
+
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch._last_msg_id["lark:oc_1:ou_1"] = "om_1"
+
+    caplog.set_level(logging.ERROR)
+    asyncio.run(ch._reply_to_lark("om_1", "hi"))
+    assert any("230013" in r.message for r in caplog.records)
