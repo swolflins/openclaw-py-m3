@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -345,3 +346,149 @@ def test_lark_channel_reply_logs_failure(monkeypatch, caplog):
     caplog.set_level(logging.ERROR)
     asyncio.run(ch._reply_to_lark("om_1", "hi"))
     assert any("230013" in r.message for r in caplog.records)
+
+
+# ─────── P11 端到端 mock(WS 不可达时也能跑) ───────
+
+def _make_lark_event(chat_id: str, open_id: str, message_id: str, text: str):
+    """构造一个真 P2ImMessageReceiveV1,直接喂给 LarkChannel._handle_event。"""
+    from lark_oapi.api.im.v1 import (
+        P2ImMessageReceiveV1,
+        P2ImMessageReceiveV1Data,
+    )
+    from lark_oapi.api.im.v1.model.event_sender import EventSender
+    from lark_oapi.api.im.v1.model.event_message import EventMessage
+
+    evt = P2ImMessageReceiveV1()
+    evt.event = P2ImMessageReceiveV1Data()
+    # init() 走 dict-only 路径 — 内嵌对象必须也是 dict
+    evt.event.sender = EventSender(
+        d={"sender_id": {"open_id": open_id, "union_id": "uu", "user_id": "u"},
+           "sender_type": "user", "tenant_key": "tk"}
+    )
+    evt.event.message = EventMessage(
+        d={
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "chat_type": "p2p",
+            "message_type": "text",
+            "content": json.dumps({"text": text}, ensure_ascii=False),
+        }
+    )
+    return evt
+
+
+def test_lark_e2e_echo_agent_replies_with_cached_message_id(monkeypatch):
+    """真 P2ImMessageReceiveV1 → _handle_event → dispatch(echo agent) → _reply_to_lark。"""
+    from openclaw.channels.lark import LarkChannel
+    from openclaw.config.settings import LarkSettings
+
+    replies: list[tuple[str, str]] = []
+
+    async def _fake_reply(self, message_id, text):
+        replies.append((message_id, text))
+
+    monkeypatch.setattr(LarkChannel, "_reply_to_lark", _fake_reply)
+
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    evt = _make_lark_event(chat_id="oc_c1", open_id="ou_u1", message_id="om_xyz", text="ping")
+
+    asyncio.run(ch._handle_event(evt))
+
+    assert len(replies) == 1, f"应回 1 条,实际 {len(replies)}"
+    msg_id, text = replies[0]
+    assert msg_id == "om_xyz", f"reply 的 message_id 应等于入站 message_id,实际 {msg_id}"
+    assert "echo:ping" in text or "ping" in text
+    # session_id 格式
+    assert "lark:oc_c1:ou_u1" in ch._last_msg_id
+    assert ch._last_msg_id["lark:oc_c1:ou_u1"] == "om_xyz"
+    # LarkChannel 收到消息 + 回信 的中间产物
+    assert len(ch.received) == 1
+    assert ch.received[0].text == "ping"
+    assert ch.received[0].session_id == "lark:oc_c1:ou_u1"
+    assert ch.received[0].metadata["is_dm"] is True
+    assert ch.received[0].metadata["message_id"] == "om_xyz"
+
+
+def test_lark_e2e_multiturn_keeps_message_id_for_session(monkeypatch):
+    """同一个 session 连续两条消息 → 都 reply 到各自的 message_id。"""
+    from openclaw.channels.lark import LarkChannel
+    from openclaw.config.settings import LarkSettings
+
+    replies: list[tuple[str, str]] = []
+
+    async def _fake_reply(self, message_id, text):
+        replies.append((message_id, text))
+
+    monkeypatch.setattr(LarkChannel, "_reply_to_lark", _fake_reply)
+
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    # 第一条
+    e1 = _make_lark_event("oc_c", "ou_u", "om_001", "hi")
+    asyncio.run(ch._handle_event(e1))
+    # 第二条
+    e2 = _make_lark_event("oc_c", "ou_u", "om_002", "there")
+    asyncio.run(ch._handle_event(e2))
+
+    assert [m for m, _ in replies] == ["om_001", "om_002"]
+    # 缓存更新到最后一条
+    assert ch._last_msg_id["lark:oc_c:ou_u"] == "om_002"
+
+
+def test_lark_e2e_drops_empty_text(monkeypatch):
+    """空文本(其它 message_type 没解析出 text)→ 不发 reply。"""
+    from openclaw.channels.lark import LarkChannel
+    from openclaw.config.settings import LarkSettings
+
+    replies: list[tuple[str, str]] = []
+
+    async def _fake_reply(self, message_id, text):
+        replies.append((message_id, text))
+
+    monkeypatch.setattr(LarkChannel, "_reply_to_lark", _fake_reply)
+
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    evt = _make_lark_event("oc_c", "ou_u", "om_x", "")  # 空
+    asyncio.run(ch._handle_event(evt))
+
+    assert replies == [], f"空文本应被 drop,实际回了 {replies}"
+    # 空文本时,_handle_event 提前 return,连 message_id 都不缓存(更干净)
+    assert ch._last_msg_id == {}
+
+
+def test_lark_e2e_post_message_extracts_text(monkeypatch):
+    """post 类型消息(富文本)能正确提取第一段纯文本。"""
+    from openclaw.channels.lark import LarkChannel
+    from openclaw.config.settings import LarkSettings
+
+    replies: list[tuple[str, str]] = []
+
+    async def _fake_reply(self, message_id, text):
+        replies.append((message_id, text))
+
+    monkeypatch.setattr(LarkChannel, "_reply_to_lark", _fake_reply)
+
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    # post 类型 content
+    from lark_oapi.api.im.v1 import (
+        P2ImMessageReceiveV1, P2ImMessageReceiveV1Data,
+    )
+    from lark_oapi.api.im.v1.model.event_sender import EventSender
+    from lark_oapi.api.im.v1.model.event_message import EventMessage
+
+    evt = P2ImMessageReceiveV1()
+    evt.event = P2ImMessageReceiveV1Data()
+    evt.event.sender = EventSender(
+        d={"sender_id": {"open_id": "ou_u", "union_id": "u", "user_id": "u"},
+           "sender_type": "user", "tenant_key": "tk"}
+    )
+    post_content = json.dumps({
+        "content": [[{"tag": "text", "text": "求和 1+1"}]]
+    }, ensure_ascii=False)
+    evt.event.message = EventMessage(
+        d={"message_id": "om_post", "chat_id": "oc_c", "chat_type": "p2p",
+           "message_type": "post", "content": post_content}
+    )
+    asyncio.run(ch._handle_event(evt))
+    assert len(replies) == 1
+    assert "1+1" in replies[0][1]

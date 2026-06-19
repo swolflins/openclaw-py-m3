@@ -50,8 +50,10 @@ openclaw_py/
 │   ├── phase9_smoke.py       # Dockerfile/compose/prom 静态 + Prometheus 抓取 15 条
 │   ├── lark_smoke.py         # Phase 10 飞书长连接烟测
 │   ├── lark_send_probe.py    # Phase 10 飞书 send 权限探测
-│   └── lark_config_wizard.py # Phase 10 飞书后台配置向导(5 端点 + 错误码查表)
-├── tests/                 # 201 个测试
+│   ├── lark_config_wizard.py # Phase 10 飞书后台配置向导(5 端点 + 错误码查表)
+│   ├── lark_run.py           # Phase 11 飞书 WS 启动器(本地跑,沙箱无 WSS 出网)
+│   └── lark_e2e_mock.py      # Phase 11 飞书 e2e mock(沙箱可跑)
+├── tests/                 # 208 个测试
 ├── Dockerfile             # 多阶段构建(Phase 9)
 ├── docker-compose.yml     # gateway + redis + ollama + prometheus(Phase 9)
 ├── .dockerignore
@@ -439,6 +441,33 @@ report = asyncio.run(probe_all(APP_ID, APP_SECRET))
 print(render_report(report, force_color=False))
 ```
 
+### 飞书 e2e 验证(Phase 11)
+
+**两个 launcher,选一个跑**:
+
+| 脚本 | 跑哪 | 沙箱可跑 | 用途 |
+|---|---|---|---|
+| `examples/lark_e2e_mock.py` | inject P2ImMessageReceiveV1 事件 | ✅ | 验证完整 dispatch → agent → reply 链路(本地/沙箱) |
+| `examples/lark_run.py` | 真起 WS 长连接 | ❌ 需本地 | 真发飞书(WS 出网 + 后台开 `im.message.receive_v1`) |
+
+**沙箱里的 e2e**(证明 LarkChannel 代码 OK):
+```bash
+python examples/lark_e2e_mock.py --text "你好,飞书!"
+# → ✅ reply 到 msg_id = om_demo_msg
+# → ✅ reply text = '🤖 echo: 你好,飞书!'
+```
+
+**本地真跑**(你要在你电脑上做):
+```bash
+git clone https://github.com/swolflins/openclaw-py-m3.git
+cd openclaw-py-m3
+pip install -e .
+export LARK_APP_ID=cli_xxx
+export LARK_APP_SECRET=xxx
+python examples/lark_run.py
+# 飞书 app 搜 bot 名 → 私聊发消息 → 立即回 🤖 echo: ...
+```
+
 ### ChannelManager 行为
 - `register()` 自动注入 `agent_loop` / `auto_reply` / `on_reply`,避免每个 channel 重复构造
 - `start_all()` 用 `asyncio.gather` 拉起所有 channel,任一抛错会传播(便于 fail-fast)
@@ -561,6 +590,7 @@ my_plugin = "my_plugin:register"
 | Phase 8:Gateway(L7) | ✅ | FastAPI REST + Web UI(单页:侧栏 session + 聊天 + 工具 / skills 抽屉)— 164 测试 |
 | Phase 9:生产化(L8) | ✅ | Dockerfile(多阶段 + non-root + healthcheck)+ docker-compose(gateway + redis + ollama + prometheus)+ Prometheus 文本格式 metrics + GitHub Actions CI(Python 3.10/3.11/3.12 matrix)+ Makefile — 189 测试 |
 | Phase 10:飞书配置向导(L9) | ✅ | `examples/lark_config_wizard.py` — 5 端点探针 + 25+ 错误码查表 + 6 步「后台操作清单」(`openclaw.channels.lark_wizard`);已集成 `lark_smoke.py` — 201 测试 |
+| Phase 11:飞书 e2e 验证(L10) | ✅ | 修 `LarkChannel.send` 真正接 reply 端点(message_id 缓存);`examples/lark_run.py` 真起 WS + `examples/lark_e2e_mock.py` 沙箱可跑 e2e;4 个 dispatch 端到端单测 + reply 路径 3 个 — 208 测试 |
 
 ## 开发 & 部署(Phase 9)
 
