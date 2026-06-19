@@ -24,9 +24,6 @@ try:  # 飞书 SDK 可选依赖
     from lark_oapi.api.im.v1 import (
         P2ImMessageReceiveV1,
     )
-    from lark_oapi.event.callback.model.p2.card_action_trigger import (
-        P2CardActionTrigger,  # noqa: F401
-    )
 
     _HAS_LARK = True
 except Exception:  # pragma: no cover - 兼容未装 SDK
