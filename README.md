@@ -47,8 +47,11 @@ openclaw_py/
 │   ├── phase6_smoke.py       # Auto-Reply + Skills 端到端
 │   ├── phase7_smoke.py       # 多渠道入站 + ChannelManager + 真 LLM 端到端
 │   ├── phase8_smoke.py       # 启 uvicorn + curl 25 条端到端
-│   └── phase9_smoke.py       # Dockerfile/compose/prom 静态 + Prometheus 抓取 15 条
-├── tests/                 # 189 个测试
+│   ├── phase9_smoke.py       # Dockerfile/compose/prom 静态 + Prometheus 抓取 15 条
+│   ├── lark_smoke.py         # Phase 10 飞书长连接烟测
+│   ├── lark_send_probe.py    # Phase 10 飞书 send 权限探测
+│   └── lark_config_wizard.py # Phase 10 飞书后台配置向导(5 端点 + 错误码查表)
+├── tests/                 # 201 个测试
 ├── Dockerfile             # 多阶段构建(Phase 9)
 ├── docker-compose.yml     # gateway + redis + ollama + prometheus(Phase 9)
 ├── .dockerignore
@@ -386,7 +389,7 @@ mgr.register(TelegramChannel.from_env(agent))  # 从 env 读 TELEGRAM_BOT_TOKEN
 |---|---|---|---|
 | `EchoChannel` | 测试桩 | `dispatch()` | 无外部依赖,灌入即收 |
 | `CLIChannel` | REPL | stdin | 终端交互 |
-| `LarkChannel` | 飞书长连接 | WS | 旧版,保持兼容 |
+| `LarkChannel` | 飞书长连接 | WS | 旧版,保持兼容;后台配置请跑 `examples/lark_config_wizard.py` |
 | `TelegramChannel` | Bot API | long polling | `send` 自动 4000 字切分 |
 | `DiscordChannel` | Interactions API | webhook + 可选 gateway | slash 命令 + Ed25519 验签(可选) |
 | `SlackChannel` | Events API | webhook | HMAC-SHA256 验签(`X-Slack-Signature`),自动去 `<@BOTID>` |
@@ -403,6 +406,38 @@ mgr.register(TelegramChannel.from_env(agent))  # 从 env 读 TELEGRAM_BOT_TOKEN
 | Slack | `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` |
 | WhatsApp | `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_ID`, `WHATSAPP_VERIFY_TOKEN` |
 | Signal | `SIGNAL_CLI_URL` (默认 `http://localhost:8080`), `SIGNAL_ACCOUNT` |
+
+### 飞书后台配置向导(Phase 10)
+
+如果你拿 `LARK_APP_ID` / `LARK_APP_SECRET` 去连飞书 bot,卡在 230013 / 230002 / 99991672 这种错,**不知道下一步该去后台哪一页** — 跑这个:
+
+```bash
+export LARK_APP_ID=cli_xxx
+export LARK_APP_SECRET=xxx
+python examples/lark_config_wizard.py
+```
+
+它会做 5 个端点探针 (`tenant_access_token` / `bot/v3/info` / `application/v6/applications/:app_id` / `contact/v1/scope/get` / `im/v1/chats`) + 1 个手动检查项 (`event/v1/subscriptions`),按顺序输出:
+
+1. 每个端点的 `http` / `code` / `msg` 状态(✅ ok / ⚠️ degraded / ❌ error)
+2. 6 步「后台操作清单」— 按顺序执行就能把 bot 跑通(事件订阅 → 搜 bot 名字 → 权限申请 → 版本发布 → 可见范围)
+3. 25+ 错误码 → 中文说明 + 修复路径(覆盖 10014 / 230013 / 230002 / 230020 / 230022 / 99991663 / 99991672 / 99992402)
+
+完整 JSON 报告写入 `/tmp/lark_wizard_report.json`,可给后续脚本解析。
+
+错误码查表 API(`openclaw.channels.lark_wizard.lookup_error`):
+
+```python
+from openclaw.channels.lark_wizard import lookup_error, probe_all, render_report
+
+# 单独查表
+e = lookup_error("im", 230013)
+print(e["title"], "→", e["fix"])
+
+# 跑全套
+report = asyncio.run(probe_all(APP_ID, APP_SECRET))
+print(render_report(report, force_color=False))
+```
 
 ### ChannelManager 行为
 - `register()` 自动注入 `agent_loop` / `auto_reply` / `on_reply`,避免每个 channel 重复构造
@@ -525,6 +560,7 @@ my_plugin = "my_plugin:register"
 | Phase 7:多渠道(L6) | ✅ | CLI / 飞书 / Telegram / Discord / Slack / WhatsApp / Signal / iMessage(112 测试) |
 | Phase 8:Gateway(L7) | ✅ | FastAPI REST + Web UI(单页:侧栏 session + 聊天 + 工具 / skills 抽屉)— 164 测试 |
 | Phase 9:生产化(L8) | ✅ | Dockerfile(多阶段 + non-root + healthcheck)+ docker-compose(gateway + redis + ollama + prometheus)+ Prometheus 文本格式 metrics + GitHub Actions CI(Python 3.10/3.11/3.12 matrix)+ Makefile — 189 测试 |
+| Phase 10:飞书配置向导(L9) | ✅ | `examples/lark_config_wizard.py` — 5 端点探针 + 25+ 错误码查表 + 6 步「后台操作清单」(`openclaw.channels.lark_wizard`);已集成 `lark_smoke.py` — 201 测试 |
 
 ## 开发 & 部署(Phase 9)
 

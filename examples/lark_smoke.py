@@ -183,13 +183,15 @@ async def main() -> None:
             print(f"     session_id = {sid}")
             print(f"     text       = {txt[:80]}")
 
-    print("\n=== 飞书烟测完成 ===")
-    print("\n下一步:")
+    print("\n=== 飞书烟测完成 ===\n")
+    print("下一步:")
     print("  1) 上面所有 ✅ → 凭据可用,LarkChannel 已就绪")
-    print("  2) 启动 gateway:`uvicorn openclaw.gateway.app:app --host 0.0.0.0 --port 8080`")
-    print("  3) 在另一终端:export LARK_APP_ID=... LARK_APP_SECRET=...")
+    print("  2) (可选) 跑后台配置向导,看 bot 还需要在开发者后台做哪些操作:")
+    print("     python examples/lark_config_wizard.py")
+    print("  3) 启动 gateway:`uvicorn openclaw.gateway.app:app --host 0.0.0.0 --port 8080`")
+    print("  4) 在另一终端:export LARK_APP_ID=... LARK_APP_SECRET=...")
     print("     python -m openclaw run --channel lark")
-    print("  4) 用飞书 app 给自己发消息,bot 应当通过 AgentLoop 自动回复")
+    print("  5) 用飞书 app 给自己发消息,bot 应当通过 AgentLoop 自动回复")
 
 
 if __name__ == "__main__":
