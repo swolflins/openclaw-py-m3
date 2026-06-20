@@ -26,16 +26,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ".[dev,all]"
+          pip install -e ".[all]"
+          pip install pytest pytest-asyncio pytest-cov ruff fakeredis
 
       - name: Ruff
         run: ruff check openclaw/ tests/ examples/
 
-      - name: Pytest
-        run: pytest tests/ -v --tb=short --color=yes
+      - name: Test with coverage gate (70% lines / 55% branches)
+        run: pytest --cov-fail-under=70 --tb=short -q
         env:
           # 测试时不需要真 LLM key
           OPENAI_API_KEY: sk-test-not-used

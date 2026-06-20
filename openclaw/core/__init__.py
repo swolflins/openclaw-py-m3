@@ -23,6 +23,12 @@ _LAZY_EXPORTS = {
     "SkillAPI": ("openclaw.core.skills", "SkillAPI"),
     "SkillRegistry": ("openclaw.core.skills", "SkillRegistry"),
     "load_skills": ("openclaw.core.skills", "load_skills"),
+    # phase 14: sanitize (P0)
+    "strip_external_content": ("openclaw.core.sanitize", "strip_external_content"),
+    "detect_prompt_injection": ("openclaw.core.sanitize", "detect_prompt_injection"),
+    "has_prompt_injection": ("openclaw.core.sanitize", "has_prompt_injection"),
+    "normalize_text": ("openclaw.core.sanitize", "normalize_text"),
+    "is_safe_regex": ("openclaw.core.sanitize", "is_safe_regex"),
 }
 
 
@@ -55,4 +61,9 @@ __all__ = [
     "SkillAPI",
     "SkillRegistry",
     "load_skills",
+    "strip_external_content",
+    "detect_prompt_injection",
+    "has_prompt_injection",
+    "normalize_text",
+    "is_safe_regex",
 ]
