@@ -8,7 +8,7 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  # ─────── 1) 静态 + 单元测试 ───────
+  # ─────── 1) 静态 + 单元测试(ubuntu) ───────
   test:
     name: ruff + pytest
     runs-on: ubuntu-latest
@@ -50,6 +50,44 @@ jobs:
         run: pytest --cov-fail-under=70 --tb=short -q
         env:
           # 测试时不需要真 LLM key
+          OPENAI_API_KEY: sk-test-not-used
+          ANTHROPIC_API_KEY: sk-test-not-used
+
+  # ─────── 1c) Windows 兼容(临时,验证后回退到只跑 ubuntu) ───────
+  # phase 19.2:临时加 windows-latest,跑 phase 19 的 shlex + shell_exec 测试,
+  # 验证 Windows 路径解析修复 + 接受 list 模式。3-5 分钟。
+  # 验证 OK 后可注释掉此 job 节省 CI 配额。
+  test-windows:
+    name: ruff + pytest (windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    # 只在主分支 push 跑(节省 PR 配额);PR 反馈靠 ubuntu
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[all]"
+          pip install pytest pytest-asyncio pytest-cov ruff fakeredis
+
+      - name: Ruff
+        shell: pwsh
+        run: ruff check openclaw/ tests/ examples/
+
+      - name: Run phase 19 Windows tests + key regression
+        # Windows runner 只跑关键测试(避免 chromadb / apscheduler 在 Windows 上下载慢)
+        shell: pwsh
+        run: |
+          pytest tests/test_phase19_windows_shell.py tests/test_phase4.py -v --tb=short
+        env:
           OPENAI_API_KEY: sk-test-not-used
           ANTHROPIC_API_KEY: sk-test-not-used
 

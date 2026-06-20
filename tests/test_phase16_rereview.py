@@ -252,7 +252,7 @@ def test_shell_uses_shlex_and_shell_false():
     from openclaw.tools.builtin import shell as shell_mod
 
     src = inspect.getsource(shell_mod)
-    assert "shlex.split" in src
+    assert "_split_command" in src, "shell.py 应有 _split_command 跨平台包装"
     assert "shell=False" in src
     assert "shell=True" not in src
 
