@@ -13,10 +13,9 @@
 #   - HEALTHCHECK 走 /healthz
 # ──────────────────────────────────────────────────────────────
 
-ARG PYTHON_VERSION=3.11
-
 # ---------- builder ----------
-FROM python:${PYTHON_VERSION}-slim AS builder
+# 不传 PYTHON_VERSION 参数,固定 3.11(与项目 pyproject 一致)
+FROM python:3.11-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -39,7 +38,7 @@ COPY openclaw ./openclaw
 RUN pip install --no-cache-dir --no-build-isolation ".[server,redis,scheduler,fs-watch]"
 
 # ---------- runtime ----------
-FROM python:${PYTHON_VERSION}-slim AS runtime
+FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -63,7 +62,11 @@ RUN groupadd -r -g 1000 openclaw \
 WORKDIR /app
 
 # 从 builder 复制 site-packages
-COPY --from=builder /usr/local/lib/python${PYTHON_VERSION}/site-packages /usr/local/lib/python${PYTHON_VERSION}/site-packages
+# 修复(phase 18):用字面量 /usr/local/lib/python3.11/site-packages 而不是 ${PYTHON_VERSION}。
+# 旧版 ARG PYTHON_VERSION=3.11 在 buildx cache 命中时可能被替换为 python3.11.15,
+# 造成 "site-packages: not found"。Python 官方 python:3.11-slim 镜像的 site-packages
+# 路径固定是 /usr/local/lib/python3.11/site-packages,不随 patch 号变化。
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 # 应用代码
 COPY --chown=openclaw:openclaw pyproject.toml README.md ./
