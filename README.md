@@ -69,6 +69,52 @@ openclaw_py/
 
 ### 1. 安装
 
+#### 1.0 在 Windows 上安装(可选)
+
+OpenClaw-py 主体在 Windows 上能直接跑(LarkChannel 之外的所有 channel / Gateway / CLI 都可),
+但有几点要注意(从 phase 19 起优化了 shlex 路径解析 + 接受 argv list 模式):
+
+**前置**:
+- Python 3.10+([python.org](https://www.python.org/downloads/windows/) 装,勾 *Add to PATH*)
+- Git for Windows(克隆用)
+- (可选)Docker Desktop,启用 WSL2 backend(跑 docker_* 工具用)
+
+**PowerShell 安装步骤**:
+
+```powershell
+git clone https://github.com/swolflins/openclaw-py-m3.git
+cd openclaw-py-m3
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e ".[all]"
+```
+
+**`shell_exec` 工具的 Windows 注意事项**:
+
+`shell_exec` 默认用 `shlex.split` 分词,Windows 上**带反斜杠的路径**会被错误解析。
+两种解决方式:
+
+1. **推荐:直接传 list**(从 phase 19+ 开始支持,绕过 shlex 路径解析):
+   ```python
+   reg.call("shell_exec", {"command": ["notepad", "C:\\Users\\me\\file.txt"]})
+   ```
+
+2. **用正斜杠**(`/Users/me/file.txt` 在 Windows 上一样能跑):
+   ```python
+   reg.call("shell_exec", {"command": "type C:/Users/me/file.txt"})
+   ```
+
+**不工作的 channel**:
+- iMessage — 仅 macOS(`openclaw/channels/imessage.py` 显式要求 `platform.system() == "Darwin"`)
+
+**生产部署推荐**:用 WSL2 + Docker Desktop 跑同一个 Linux 镜像(下面有详)—
+这与 Linux 用户跑同一条命令,所有 CI 验证过的行为都直接复用。
+
+CI 在 `windows-latest` runner 上有专门的 `test-windows` job(phase 19.2 临时 matrix,
+跑 phase 19 的 10 个 Windows 兼容测试 + phase 4 关键回归)。
+
+#### 1.1 Linux / macOS 安装
+
 ```bash
 cd openclaw_py
 python -m venv .venv && source .venv/bin/activate
