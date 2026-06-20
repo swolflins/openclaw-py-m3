@@ -87,9 +87,10 @@ class Agent:
 
             for tc in result.tool_calls:
                 logger.info("[agent %s] tool call: %s(%s)", self.session_id, tc.name, tc.arguments)
+                # SEC-2 修复:必须走 registry.call(),触发 approver 审批流 + 限流 + 审计
+                # 旧实现 self.tools.get(tc.name)(**tc.arguments) 绕过了一切审批
                 try:
-                    tool_obj = self.tools.get(tc.name)
-                    output = await tool_obj(**(tc.arguments or {}))
+                    output = await self.tools.call(tc.name, **(tc.arguments or {}))
                     tool_content = str(output)
                 except Exception as e:
                     logger.exception("tool %s failed", tc.name)

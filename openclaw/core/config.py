@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -220,12 +221,15 @@ class ConfigLoader:
         suffix = p.suffix.lower()
         text = p.read_text(encoding="utf-8")
         if suffix in (".yaml", ".yml"):
-            return yaml.safe_load(text) or {}
-        if suffix == ".json":
-            return json.loads(text)
-        if suffix == ".toml":
-            return tomllib.loads(text)
-        raise ConfigError(f"unsupported config format: {suffix}")
+            data = yaml.safe_load(text) or {}
+        elif suffix == ".json":
+            data = json.loads(text)
+        elif suffix == ".toml":
+            data = tomllib.loads(text)
+        else:
+            raise ConfigError(f"unsupported config format: {suffix}")
+        # SEC-4:支持 ${ENV_VAR} 插值(防泄漏明文 secret)
+        return _interp_env(data)
 
     @staticmethod
     def _merge_env(cfg: OpenClawConfig) -> OpenClawConfig:
@@ -250,6 +254,34 @@ def _env_to_dict(prefix: str) -> dict[str, Any]:
             cur = cur.setdefault(part, {})  # type: ignore[assignment]
         cur[path[-1]] = _coerce(v)
     return out
+
+
+# SEC-4:支持 ${ENV_VAR} / ${ENV_VAR:-default} 插值
+_ENV_INTERP_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _interp_env(obj: Any) -> Any:
+    """递归把 dict/list/str 里的 ${ENV_VAR} 替换为 os.environ 值。
+
+    - 形式 1:`${NAME}` → os.environ["NAME"](没设时原样保留 + 警告)
+    - 形式 2:`${NAME:-default}` → os.environ["NAME"] 或 default
+    """
+    if isinstance(obj, dict):
+        return {k: _interp_env(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_interp_env(x) for x in obj]
+    if isinstance(obj, str):
+        def _sub(m: re.Match) -> str:
+            name, default = m.group(1), m.group(2)
+            val = os.environ.get(name, default)
+            if val is None:
+                logger.warning(
+                    "config_env_missing: %s not set and no default", name
+                )
+                return ""
+            return val
+        return _ENV_INTERP_RE.sub(_sub, obj)
+    return obj
 
 
 def _coerce(v: str) -> Any:

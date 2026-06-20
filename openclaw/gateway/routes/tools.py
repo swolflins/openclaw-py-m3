@@ -48,32 +48,42 @@ async def call_tool(req: ToolCallRequest) -> dict:
     try:
         result = await reg.call(req.name, req.arguments)
         m.tool_calls_total.inc(tool=req.name, approved="true")
-    except PermissionError as e:
+    except PermissionError:
         # 危险工具(EXE/ADMIN)需要审批,会抛 PermissionError
         m.tool_calls_total.inc(tool=req.name, approved="false")
-        raise HTTPException(409, f"approval required: {e}") from e
-    except KeyError as e:
-        raise HTTPException(404, f"tool not found: {e}") from e
-    except Exception as e:
-        raise HTTPException(500, f"call error: {type(e).__name__}: {e}") from e
-    return {"name": req.name, "result": to_jsonable(result)}
+        # SEC-5/SEC-11:不外露原始 exception message(可能含 token / path / 内部信息)
+        raise HTTPException(409, "tool approval required or denied") from None
+    except KeyError:
+        # SEC-11:不外露原始 exception message
+        raise HTTPException(404, "tool not found") from None
+    # 其他异常(SEC-11)— 走全局 handler,不外露 stack 跟原 message
+    return {"ok": True, "name": req.name, "result": to_jsonable(result)}
 
 
 class ApproveRequest(BaseModel):
     approved: bool
+    # SEC-5 修复:开启"一键全放行"必须传 confirm="CONFIRM" 作为人类意图证明
+    confirm: str | None = None
 
 
 @router.post("/approver")
 async def set_approver_mode(req: ApproveRequest) -> dict:
     """设置"是否自动批准"。
 
-    简单实现:把 registry 的 approver 设为 (always allow / always deny)。
-    生产环境应该接 Web 端审批流(WebUI 弹窗 → 提交到本端)。
+    安全(SEC-5):
+    - 启用"全部放行"必须 confirm="CONFIRM" 否则 403
+    - 关闭永远放行(approved=False)无 confirm 要求
     """
     reg = _registry()
     if reg is None:
         raise HTTPException(503, "agent_loop / tools not attached")
     if req.approved:
+        if req.confirm != "CONFIRM":
+            raise HTTPException(
+                403,
+                "enabling 'always approve' requires confirm='CONFIRM' "
+                "(SEC-5:防止误操作开启全放行)",
+            )
         async def _ok(name: str, args: dict[str, Any]) -> bool:
             return True
         reg.set_approver(_ok)

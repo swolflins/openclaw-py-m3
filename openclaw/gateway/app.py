@@ -35,6 +35,14 @@ def create_app(deps: GatewayDeps | None = None) -> FastAPI:
         from openclaw.gateway.deps import set_deps
         set_deps(deps)
 
+    # 鉴权中间件(SEC-1)— 配置 OPENCLAW_GATEWAY_TOKEN 后启用,未配置则仅 dev
+    from openclaw.gateway.auth import install_auth
+    install_auth(app)
+
+    # 全局异常处理(SEC-11)— 500 错误不外露原始异常消息
+    from openclaw.gateway.errors import register_error_handlers
+    register_error_handlers(app)
+
     # 注册路由
     app.include_router(health.router)
     app.include_router(chat.router, prefix="/v1")

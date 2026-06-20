@@ -2,6 +2,7 @@
 
 - read_file / write_file / list_dir / search_files / append_file / file_stat
 - 安全:支持 root 限制(只允许在指定根目录下操作)
+- SEC-8:严格路径校验,拒绝 ..、symlink 逃逸、pattern 净化
 """
 from __future__ import annotations
 
@@ -12,6 +13,26 @@ from openclaw.core.logging import get_logger
 from openclaw.tools.registry import ToolCategory, ToolPermission, ToolRegistry
 
 logger = get_logger(__name__)
+
+
+# 任何"上跳"或绝对路径组件都视为拒绝
+_FORBIDDEN_PATH_PARTS = {"..", "~"}
+
+
+def _sanitize_glob(pattern: str) -> str:
+    """SEC-8:净化 glob pattern,去除可逃逸 sandbox 的部分。
+
+    实际我们不允许"..",所以如果 pattern 包含 .. 任何形式 → 拒绝。
+    另外禁止用绝对路径模式(以 / 开头)。
+    """
+    if not pattern:
+        return "*"
+    if pattern.startswith("/"):
+        raise PermissionError(f"absolute glob pattern not allowed: {pattern!r}")
+    # rglob('a/../b') 仍会逃出 root,阻止
+    if ".." in pattern.split("/"):
+        raise PermissionError(f"glob pattern contains '..': {pattern!r}")
+    return pattern
 
 
 def register_fs_tools(
@@ -25,25 +46,53 @@ def register_fs_tools(
     base.mkdir(parents=True, exist_ok=True)
 
     def _safe(p: Path | str) -> Path:
-        target = (base / p).resolve() if not Path(p).is_absolute() else Path(p).resolve()
-        # 允许 root 内的相对路径,不允许逃出 root
-        if base in target.parents or target == base:
-            return target
-        # 严格:在 base 下
+        """路径校验,返回的绝对路径必须严格在 base 下。
+
+        SEC-8:
+        - 禁止 path 里含 .. 或 ~ 组件
+        - 禁止绝对路径
+        - resolve 后必须以 base 为前缀
+        - 必须存在 / 真实(不依赖 symlink 中转)
+        """
+        if not isinstance(p, (str, Path)):
+            raise PermissionError("path must be str or Path")
+        sp = str(p)
+        if not sp:
+            raise PermissionError("empty path")
+        # 拒绝任何 .. 或 ~ 组件(防 symlink 解析前逃逸)
+        parts = re.split(r"[\\/]+", sp)
+        for part in parts:
+            if part in _FORBIDDEN_PATH_PARTS:
+                raise PermissionError(f"path component {part!r} not allowed: {p}")
+        if sp.startswith("/"):
+            raise PermissionError(f"absolute path not allowed: {p}")
+
+        target = (base / sp).resolve()
+        # 严格:resolve 后必须以 base 开头
         try:
             target.relative_to(base)
         except ValueError:
-            raise PermissionError(f"path {target} escapes root {base}")
+            raise PermissionError(
+                f"path {p!r} resolves to {target} which escapes root {base}"
+            )
         return target
 
     @registry.tool(category=ToolCategory.FS, permission=ToolPermission.READ)
     def read_file(path: str, max_bytes: int = 0) -> str:
-        """读取文件内容。path: 相对或绝对路径(以 root 为基准); max_bytes: 0=使用默认上限。"""
+        """读取文件内容。path: 相对路径(以 root 为基准); max_bytes: 0=使用默认上限。"""
         p = _safe(path)
         if not p.exists():
             return f"[error] file not found: {p}"
+        # 二次校验:不读 symlink 到 sandbox 外
+        real = p.resolve()
+        try:
+            real.relative_to(base)
+        except ValueError:
+            return f"[error] file escaped sandbox (symlink?): {p}"
+        if not real.is_file():
+            return f"[error] not a regular file: {p}"
         cap = max_bytes or max_read_bytes
-        text = p.read_text(encoding="utf-8", errors="replace")
+        text = real.read_text(encoding="utf-8", errors="replace")
         if len(text) > cap:
             text = text[:cap] + f"\n... [truncated, {len(text) - cap} chars omitted]"
         return text
@@ -76,8 +125,16 @@ def register_fs_tools(
             return f"[error] dir not found: {p}"
         if not p.is_dir():
             return f"[error] not a directory: {p}"
+        # SEC-8:pattern 净化
+        pattern = _sanitize_glob(pattern)
         entries: list[str] = []
         for child in sorted(p.glob(pattern)):
+            # 防止子项本身是 symlink 逃逸
+            try:
+                real = child.resolve()
+                real.relative_to(base)
+            except ValueError:
+                continue
             tag = "/" if child.is_dir() else ""
             size = "" if child.is_dir() else f"  {child.stat().st_size}b"
             entries.append(f"{child.name}{tag}{size}")
@@ -95,9 +152,18 @@ def register_fs_tools(
         if not p.exists():
             return f"[error] dir not found: {p}"
 
+        # SEC-8:pattern 净化
+        if not regex:
+            pattern = _sanitize_glob(pattern)
         results: list[str] = []
         if not regex:
             for f in p.rglob(pattern or "*"):
+                # 防 symlink 逃逸
+                try:
+                    real = f.resolve()
+                    real.relative_to(base)
+                except ValueError:
+                    continue
                 results.append(str(f.relative_to(p)))
                 if len(results) >= max_results:
                     break
@@ -110,7 +176,12 @@ def register_fs_tools(
                 if not f.is_file():
                     continue
                 try:
-                    text = f.read_text(encoding="utf-8", errors="ignore")
+                    real = f.resolve()
+                    real.relative_to(base)
+                except ValueError:
+                    continue
+                try:
+                    text = real.read_text(encoding="utf-8", errors="ignore")
                 except OSError:
                     continue
                 for i, line in enumerate(text.splitlines(), 1):

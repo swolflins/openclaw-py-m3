@@ -170,9 +170,15 @@ class ToolRegistry:
     ) -> Tool:
         tool_name = name or func.__name__
         schema, auto_desc = _build_schema(func)
-        # 默认:permission >= EXEC 的需要审批
+        # 默认:permission >= NETWORK(>=WRITE)的需要审批
+        # SEC-2:NETWORK 也加审批(SSRF / 数据外泄)
         if requires_approval is None:
-            requires_approval = permission in (ToolPermission.EXEC, ToolPermission.ADMIN)
+            requires_approval = permission in (
+                ToolPermission.WRITE,
+                ToolPermission.NETWORK,
+                ToolPermission.EXEC,
+                ToolPermission.ADMIN,
+            )
         t = Tool(
             name=tool_name,
             description=description or auto_desc,

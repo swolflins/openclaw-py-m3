@@ -373,7 +373,8 @@ def test_tools_call_not_found(client):
 
 
 def test_tools_set_approver_allow(client):
-    r = client.post("/v1/tools/approver", json={"approved": True})
+    # SEC-5:开启"一键全放行"必须 confirm="CONFIRM"
+    r = client.post("/v1/tools/approver", json={"approved": True, "confirm": "CONFIRM"})
     assert r.status_code == 200
     # 之后再调 shell_exec 应通过
     r2 = client.post("/v1/tools/call", json={"name": "shell_exec", "arguments": {"cmd": "ls"}})
@@ -407,6 +408,13 @@ def test_skills_reload_explicit_dirs(client, deps):
         "triggers:\n  - 你好\n---\n\n回复: 你好!这是测试 skill。\n",
         encoding="utf-8",
     )
+    # SEC-6:reload 只接受 config.skills.directories 白名单中的目录
+    # 这里把 parent 加到白名单
+    from openclaw.core.config import SkillsConfig
+    if deps.config is None:
+        from openclaw.core.config import OpenClawConfig
+        deps.config = OpenClawConfig()
+    deps.config.skills = SkillsConfig(directories=[str(parent)])
     r = client.post("/v1/skills/reload", json={"directories": [str(parent)]})
     assert r.status_code == 200
     body = r.json()
