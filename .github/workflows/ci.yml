@@ -84,9 +84,10 @@ jobs:
 
       - name: Run phase 19 Windows tests + key regression
         # Windows runner 只跑关键测试(避免 chromadb / apscheduler 在 Windows 上下载慢)
+        # 用 -o addopts= 覆盖 pyproject.toml 里的 --cov-fail-under(此 job 目的是验证 Windows 路径,不是覆盖全代码)
         shell: pwsh
         run: |
-          pytest tests/test_phase19_windows_shell.py tests/test_phase4.py -v --tb=short
+          pytest -o addopts="" tests/test_phase19_windows_shell.py tests/test_phase4.py -v --tb=short
         env:
           OPENAI_API_KEY: sk-test-not-used
           ANTHROPIC_API_KEY: sk-test-not-used
