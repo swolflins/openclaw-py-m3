@@ -3,6 +3,7 @@
 - 系统提示 = 配置 system_prompt + SOUL 文档
 - 消息 = soul-augmented system + recalled context + 短期 history + user
 - 完成后写回短期(per session_id),把 assistant 回复索引到长期
+- 完成时自动写一份 AgentJournal(自我反思) — Idea #5
 
 RT-4:支持历史窗口裁剪(防 token 爆)。
 """
@@ -10,6 +11,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
 
 from openclaw.core.logging import get_logger
 from openclaw.llm.base import BaseLLMProvider, ChatMessage, ToolCall
@@ -17,6 +20,14 @@ from openclaw.memory.scoped import ScopedMemory
 from openclaw.tools.registry import ToolRegistry
 
 logger = get_logger(__name__)
+
+# 可选:AgentJournal 懒加载
+try:
+    from openclaw.agent.journal import AgentJournal
+    _HAS_JOURNAL = True
+except Exception:  # pragma: no cover
+    AgentJournal = None  # type: ignore[assignment]
+    _HAS_JOURNAL = False
 
 
 def trim_history(
@@ -96,6 +107,8 @@ class Agent:
         # 软窗口:超过后裁剪掉"中间"的历史(保留 system + 最新 N 轮)
         history_soft_window: int = 40,
         recall_top_k: int = 3,
+        # Idea #5:可选 journal — 完成后自动写反思
+        journal: Optional["AgentJournal"] = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -107,6 +120,7 @@ class Agent:
         self.history_max_chars = history_max_chars
         self.history_soft_window = history_soft_window
         self.recall_top_k = recall_top_k
+        self.journal = journal
 
     async def run(self, user_message: str) -> AgentResponse:
         # 1. 拼装 messages(注入 soul + recall)
@@ -121,6 +135,8 @@ class Agent:
 
         iterations = 0
         all_tool_calls: list[ToolCall] = []
+        tool_results: list[dict] = []  # for journal
+        started_at = datetime.now(timezone.utc)
 
         for i in range(self.max_tool_iterations):
             iterations += 1
@@ -141,6 +157,7 @@ class Agent:
                     session_id=self.session_id,
                 )
                 await self.memory.append_turn(self.session_id, user_message, final.content)
+                await self._maybe_journal(user_message, final, tool_results, started_at)
                 return final
 
             # tool_calls 分支
@@ -155,11 +172,13 @@ class Agent:
                 # SEC-2 修复:必须走 registry.call(),触发 approver 审批流 + 限流 + 审计
                 # 旧实现 self.tools.get(tc.name)(**tc.arguments) 绕过了一切审批
                 try:
-                    output = await self.tools.call(tc.name, **(tc.arguments or {}))
+                    output = await self.tools.call(tc.name, dict(tc.arguments or {}))
                     tool_content = str(output)
+                    tool_results.append({"name": tc.name, "result": tool_content})
                 except Exception as e:
                     logger.exception("tool %s failed", tc.name)
                     tool_content = f"[tool error] {type(e).__name__}: {e}"
+                    tool_results.append({"name": tc.name, "result": tool_content, "error": True})
 
                 messages.append(
                     ChatMessage(role="tool", content=tool_content, tool_call_id=tc.id, name=tc.name)
@@ -174,7 +193,39 @@ class Agent:
             session_id=self.session_id,
         )
         await self.memory.append_turn(self.session_id, user_message, final.content)
+        await self._maybe_journal(user_message, final, tool_results, started_at)
         return final
+
+    async def _maybe_journal(
+        self,
+        user_message: str,
+        response: AgentResponse,
+        tool_results: list[dict],
+        started_at: datetime,
+    ) -> None:
+        """Idea #5:session 结束后自动写 journal + reflect + soul_proposal。"""
+        if self.journal is None:
+            return
+        try:
+            entry = self.journal.record_session(
+                session_id=self.session_id,
+                user_message=user_message,
+                response=response,
+                started_at=started_at,
+                tool_results=tool_results,
+            )
+            # 同步 reflect(模板版不耗时)
+            try:
+                await self.journal.reflect(entry)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("journal reflect failed: %s", e)
+            # 生成 SOUL proposal
+            try:
+                self.journal.generate_soul_proposal(entry)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("journal soul_proposal failed: %s", e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("journal record failed (不影响主流程): %s", e)
 
 
 class AgentLoop:
@@ -192,6 +243,7 @@ class AgentLoop:
         history_max_chars: int = 200_000,
         history_soft_window: int = 40,
         recall_top_k: int = 3,
+        journal: Optional["AgentJournal"] = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -202,6 +254,7 @@ class AgentLoop:
         self.history_max_chars = history_max_chars
         self.history_soft_window = history_soft_window
         self.recall_top_k = recall_top_k
+        self.journal = journal
         self._agents: dict[str, Agent] = {}
 
     def _get_agent(self, session_id: str) -> Agent:
@@ -215,6 +268,7 @@ class AgentLoop:
                 max_tool_iterations=self.max_tool_iterations,
                 history_window=self.history_window,
                 recall_top_k=self.recall_top_k,
+                journal=self.journal,
             )
         return self._agents[session_id]
 
