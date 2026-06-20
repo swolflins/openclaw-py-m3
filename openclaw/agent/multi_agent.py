@@ -104,7 +104,10 @@ class MultiAgentRoles:
 
     async def run(self, user_message: str) -> MultiAgentResult:
         plan = await self._plan(user_message)
-        execution = await self._execute(plan, reflections=[])
+        # RT-6 修复:reflection 重试时,已 done 的 step 不再重复执行
+        from openclaw.agent.planner import StepStatus
+        step_cache: dict[str, Any] = {}
+        execution = await self._execute(plan, reflections=[], step_cache=step_cache)
         # 反思循环:失败的步骤让 reflector 提建议,改 plan 后重跑
         loops = 0
         reflections: list[str] = []
@@ -119,7 +122,11 @@ class MultiAgentRoles:
             advice = await self._reflect(failed.step, failed.error or "")
             reflections.append(advice)
             plan = self._patch_plan(plan, failed.step, advice)
-            execution = await self._execute(plan, reflections=reflections)
+            # RT-6:把上次执行中 done 的 step 填进 cache
+            for r in execution.steps:
+                if r.status == StepStatus.DONE:
+                    step_cache[r.step_id] = r
+            execution = await self._execute(plan, reflections=reflections, step_cache=step_cache)
             loops += 1
 
         # 把上游步骤输出拼成最终答案(最后一个 DONE 步骤的 output)
@@ -177,12 +184,18 @@ class MultiAgentRoles:
 
     # ---------- Executor (bridged) ----------
 
-    async def _execute(self, plan: Plan, reflections: list[str]) -> PlanResult:
+    async def _execute(
+        self,
+        plan: Plan,
+        reflections: list[str],
+        *,
+        step_cache: dict[str, Any] | None = None,
+    ) -> PlanResult:
         exec_ = PlanExecutor(
             on_llm=self._on_llm,
             on_tool=self._on_tool,
         )
-        return await exec_.run(plan)
+        return await exec_.run(plan, step_cache=step_cache)
 
     async def _on_llm(self, prompt: str, step: PlanStep) -> str:
         msgs = [
@@ -293,10 +306,11 @@ class MultiAgentRoles:
         )
 
     def _first_failed(self, execution: PlanResult) -> Optional[Any]:
+        # RT-5 修复:只返回 critical=True 的失败步骤,避免对非关键步骤浪费 reflector 推理
         smap = execution.plan.step_map()
         for r in execution.steps:
             if r.status.value == "failed":
                 s = smap.get(r.step_id)
-                if s is not None:
+                if s is not None and s.critical:
                     return type("F", (), {"step": s, "error": r.error})()
         return None

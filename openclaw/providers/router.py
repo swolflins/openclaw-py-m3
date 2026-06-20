@@ -9,6 +9,10 @@
 step-粒度 fallback:
 - 提供 acomplete_with_step() 包装,支持 per-step 策略(plan-execute 时)
 - 单次失败时累计 attempts,超过 max_attempts 才升级到"换 provider"
+
+**RT-7 修复**:
+- 加熔断器(CircuitBreaker):连续 N 次失败 → open 状态 → 短期跳过
+- 用 ``tenacity`` 替代手写指数退避重试(可控、可观测)
 """
 from __future__ import annotations
 
@@ -24,6 +28,71 @@ from openclaw.llm.base import BaseLLMProvider, ChatMessage, LLMResult, ToolSpec
 logger = get_logger(__name__)
 
 Strategy = Literal["fallback_only", "round_robin", "cost_aware", "priority"]
+
+
+# ---------------------------------------------------------------------------
+# RT-7: Circuit Breaker
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _BreakerState:
+    """单个 provider 的熔断状态。
+
+    状态机:
+      CLOSED (正常) → 连续 N 次失败 → OPEN(熔断)
+      OPEN(熔断) → 冷却 K 秒 → HALF_OPEN(放一次探针)
+      HALF_OPEN → 成功 → CLOSED;失败 → OPEN
+    """
+    fail_count: int = 0
+    open_until: float = 0.0
+    state: str = "closed"  # closed / open / half_open
+
+    def is_open(self) -> bool:
+        if self.state == "open":
+            if time.time() >= self.open_until:
+                self.state = "half_open"
+                return False
+            return True
+        return False
+
+    def record_success(self) -> None:
+        self.fail_count = 0
+        self.state = "closed"
+
+    def record_failure(self, fail_threshold: int, cooldown: float) -> None:
+        self.fail_count += 1
+        if self.fail_count >= fail_threshold or self.state == "half_open":
+            self.state = "open"
+            self.open_until = time.time() + cooldown
+
+
+class CircuitBreaker:
+    """Provider 维度的熔断器。
+
+    Args:
+        fail_threshold: 连续失败次数,达此值熔断
+        cooldown: 熔断持续秒数
+    """
+
+    def __init__(self, fail_threshold: int = 5, cooldown: float = 30.0) -> None:
+        self.fail_threshold = fail_threshold
+        self.cooldown = cooldown
+        self._states: dict[str, _BreakerState] = {}
+
+    def is_open(self, key: str) -> bool:
+        st = self._states.setdefault(key, _BreakerState())
+        return st.is_open()
+
+    def record_success(self, key: str) -> None:
+        st = self._states.setdefault(key, _BreakerState())
+        st.record_success()
+
+    def record_failure(self, key: str) -> None:
+        st = self._states.setdefault(key, _BreakerState())
+        st.record_failure(self.fail_threshold, self.cooldown)
+
+    def state_of(self, key: str) -> str:
+        return self._states.setdefault(key, _BreakerState()).state
 
 
 @dataclass
@@ -56,6 +125,10 @@ class RouterStats:
             st["fail"] += 1
 
 
+def _prov_key(p: BaseLLMProvider) -> str:
+    return f"{p.__class__.__name__}:{getattr(p, 'model', '?')}"
+
+
 class ProviderRouter(BaseLLMProvider):
     def __init__(
         self,
@@ -64,6 +137,7 @@ class ProviderRouter(BaseLLMProvider):
         *,
         strategy: Strategy = "fallback_only",
         metas: Optional[dict[str, ProviderMeta]] = None,
+        breaker: Optional[CircuitBreaker] = None,
     ) -> None:
         super().__init__(model=primary.model)
         self.strategy: Strategy = strategy
@@ -71,15 +145,15 @@ class ProviderRouter(BaseLLMProvider):
         all_providers = [primary, *fallbacks]
         for p in all_providers:
             if p.__class__.__name__ not in self._metas:
-                self._metas[p.__class__.__name__ + ":" + getattr(p, "model", "?")] = ProviderMeta(
-                    provider=p
-                )
+                self._metas[_prov_key(p)] = ProviderMeta(provider=p)
         # 建立 index
         self._providers: list[BaseLLMProvider] = all_providers
         self.primary = primary
         self.fallbacks = list(fallbacks)
         self._rr_index = 0
         self.stats = RouterStats()
+        # RT-7:熔断器(共享单例)
+        self.breaker = breaker or CircuitBreaker()
 
     # ----- 排序 -----
 
@@ -104,7 +178,7 @@ class ProviderRouter(BaseLLMProvider):
                 return m
         # 兜底
         nm = ProviderMeta(provider=p)
-        self._metas[f"{p.__class__.__name__}:{getattr(p, 'model', '?')}"] = nm
+        self._metas[_prov_key(p)] = nm
         return nm
 
     def set_meta(self, provider: BaseLLMProvider, **kw: Any) -> None:
@@ -125,19 +199,25 @@ class ProviderRouter(BaseLLMProvider):
     ) -> LLMResult:
         last_err: Exception | None = None
         for prov in self._order():
-            name = f"{type(prov).__name__}:{getattr(prov, 'model', '?')}"
+            key = _prov_key(prov)
+            # RT-7:熔断中 → 跳过
+            if self.breaker.is_open(key):
+                logger.warning("router_provider_skipped_breaker_open", provider=key)
+                continue
             t0 = time.time()
             try:
-                logger.info("router_dispatch", provider=name, strategy=self.strategy)
+                logger.info("router_dispatch", provider=key, strategy=self.strategy)
                 res = await prov.acomplete(
                     messages, tools=tools, temperature=temperature, max_tokens=max_tokens
                 )
-                self.stats.record(name, ok=True, ms=int((time.time() - t0) * 1000))
+                self.stats.record(key, ok=True, ms=int((time.time() - t0) * 1000))
+                self.breaker.record_success(key)
                 return res
             except Exception as e:  # noqa: BLE001
                 last_err = e
-                self.stats.record(name, ok=False, ms=int((time.time() - t0) * 1000))
-                logger.warning("router_provider_failed", provider=name, error=str(e))
+                self.stats.record(key, ok=False, ms=int((time.time() - t0) * 1000))
+                self.breaker.record_failure(key)
+                logger.warning("router_provider_failed", provider=key, error=str(e))
                 await asyncio.sleep(0.1)
         raise ProviderError(f"all providers failed: {last_err!r}")
 
@@ -154,27 +234,47 @@ class ProviderRouter(BaseLLMProvider):
     ) -> LLMResult:
         """在当前 router 排序下,每个 provider 内部再重试 max_attempts_per_step 次,
         再切下一个 provider。
+
+        **RT-7 修复**:用 tenacity 实现指数退避重试;成功 → breaker reset,失败 → breaker 累计。
         """
+        from tenacity import (
+            AsyncRetrying,
+            retry_if_exception_type,
+            stop_after_attempt,
+            wait_exponential,
+        )
+
         last_err: Exception | None = None
         for prov in self._order():
+            key = _prov_key(prov)
+            if self.breaker.is_open(key):
+                logger.warning("router_retry_skipped_breaker_open", provider=key)
+                continue
             meta = self._meta_of(prov)
-            name = f"{type(prov).__name__}:{getattr(prov, 'model', '?')}"
             attempts = max(1, max_attempts_per_step or meta.max_attempts)
-            for k in range(attempts):
-                t0 = time.time()
-                try:
-                    res = await prov.acomplete(
-                        messages, tools=tools, temperature=temperature, max_tokens=max_tokens
-                    )
-                    self.stats.record(name, ok=True, ms=int((time.time() - t0) * 1000))
-                    return res
-                except Exception as e:  # noqa: BLE001
-                    last_err = e
-                    self.stats.record(name, ok=False, ms=int((time.time() - t0) * 1000))
-                    logger.warning(
-                        "router_retry", provider=name, attempt=k + 1, max=attempts, error=str(e)
-                    )
-                    await asyncio.sleep(0.1 * (k + 1))
+            t0 = time.time()
+            try:
+                # RT-7:tenacity 指数退避(0.1s, 0.2s, 0.4s…)
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(attempts),
+                    wait=wait_exponential(multiplier=0.1, max=1.0),
+                    retry=retry_if_exception_type(Exception),
+                    reraise=True,
+                ):
+                    with attempt:
+                        res = await prov.acomplete(
+                            messages, tools=tools, temperature=temperature, max_tokens=max_tokens
+                        )
+                        self.stats.record(key, ok=True, ms=int((time.time() - t0) * 1000))
+                        self.breaker.record_success(key)
+                        return res
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                self.stats.record(key, ok=False, ms=int((time.time() - t0) * 1000))
+                self.breaker.record_failure(key)
+                logger.warning(
+                    "router_retry_exhausted", provider=key, attempts=attempts, error=str(e)
+                )
         raise ProviderError(f"all providers failed after retries: {last_err!r}")
 
     async def aclose(self) -> None:

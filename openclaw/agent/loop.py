@@ -110,7 +110,8 @@ class Agent:
 
     async def run(self, user_message: str) -> AgentResponse:
         # 1. 拼装 messages(注入 soul + recall)
-        messages = self.memory.build_messages(
+        # RT-1: build_messages 已改 async
+        messages = await self.memory.build_messages(
             self.session_id,
             user_message,
             system_prompt=self.system_prompt,

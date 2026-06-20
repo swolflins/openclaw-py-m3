@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +90,8 @@ class LongTermStore:
             return ""
         md = dict(metadata or {})
         md["scope"] = scope
+        # MEM-4:为 LRU 淘汰写入时间戳(原版 _evict_oldest 按 _ts 升序删除)
+        md["_ts"] = time.time()
         iid = item_id or f"mem_{uuid.uuid4().hex[:12]}"
         with self._lock:
             # MEM-5:空 text 已上一步拒,这里不重检

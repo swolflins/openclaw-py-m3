@@ -97,7 +97,8 @@ def test_scoped_build_messages_contains_soul(tmp_path: Path, monkeypatch):
     s = SoulLoader()
     scoped = ScopedMemory(short_term=short, long_term=None, soul=s)
 
-    msgs = scoped.build_messages("session:1", "你叫什么", system_prompt="BASE")
+    # RT-1: build_messages 已改 async
+    msgs = asyncio.run(scoped.build_messages("session:1", "你叫什么", system_prompt="BASE"))
     # system 包含 BASE + SOUL
     sys = msgs[0].content
     assert "BASE" in sys and "ABC" in sys
@@ -114,7 +115,8 @@ def test_scoped_recall_appends_context(tmp_path: Path):
     long = LongTermStore(tmp_path / "lt", embedding_fn=_fake_embed)
     long.add("Python 的 GIL 是全局解释器锁。", scope="session:1")
     scoped = ScopedMemory(short_term=short, long_term=long, soul=None)
-    msgs = scoped.build_messages("session:1", "GIL 是什么?", recall_top_k=1)
+    # RT-1: build_messages 已改 async
+    msgs = asyncio.run(scoped.build_messages("session:1", "GIL 是什么?", recall_top_k=1))
     # 应有 1 条 system reminder + 1 user
     assert msgs[0].role == "system"
     assert msgs[1].role == "system"

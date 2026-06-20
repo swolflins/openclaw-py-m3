@@ -1,13 +1,21 @@
-"""/v1/channels 列出 / 启停 / 重启。"""
+"""/v1/channels 列出 / 启停 / 重启。
+
+**SEC-11 修复**:
+- ``channel_send`` 不再回传 ``str(e)`` 给客户端
+- 错误细节写 server log,客户端只看到 request_id
+"""
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from openclaw.core.logging import get_logger
 from openclaw.gateway.deps import get_deps
 
+logger = get_logger(__name__)
 router = APIRouter(prefix="/channels", tags=["channels"])
 
 
@@ -47,7 +55,7 @@ class SendRequest(BaseModel):
 
 
 @router.post("/send")
-async def channel_send(req: SendRequest) -> dict:
+async def channel_send(req: SendRequest, request: Request) -> dict:
     """通过指定 channel 主动发一条(测试 / 通知用)。"""
     mgr = get_channel_manager()
     if mgr is None:
@@ -59,8 +67,24 @@ async def channel_send(req: SendRequest) -> dict:
             break
     if target is None:
         raise HTTPException(404, f"channel {req.name!r} not registered")
+    request_id = getattr(request.state, "request_id", None) or uuid.uuid4().hex[:12]
     try:
         await target.send(req.session_id, req.text)
     except Exception as e:
-        raise HTTPException(500, f"send error: {type(e).__name__}: {e}") from e
+        # SEC-11 修复:不暴露 str(e) 给客户端;详细 trace 入 server log
+        logger.exception(
+            "channel_send_error",
+            request_id=request_id,
+            channel=req.name,
+            session_id=req.session_id,
+            error_type=type(e).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "request_id": request_id,
+                "type": type(e).__name__,
+            },
+        )
     return {"ok": True, "channel": req.name, "session_id": req.session_id}

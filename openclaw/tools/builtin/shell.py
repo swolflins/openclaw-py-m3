@@ -96,28 +96,36 @@ def register_shell_tools(
         timeout = float(timeout or default_timeout)
         # SEC-3 修复:不记完整 command(可能含密钥/密码),只记首词 + 长度
         try:
-            first_tok = shlex.split(command)[0]
+            tokens_for_run = shlex.split(command)
+            first_tok = tokens_for_run[0] if tokens_for_run else "<empty>"
         except ValueError:
+            tokens_for_run = None
             first_tok = "<unparseable>"
         logger.info("shell_exec", first_token=first_tok, command_len=len(command), cwd=workdir, timeout=timeout)
 
         try:
-            proc = asyncio.run(_run(command, workdir, timeout))
+            proc = asyncio.run(_run(command, workdir, timeout, tokens_for_run))
         except RuntimeError:
-            # 已在跑的 event loop,fallback to subprocess.run
+            # 已在跑的 event loop,fallback to subprocess.run(直接给分词后 args)
             import subprocess
+            args = tokens_for_run if tokens_for_run else shlex.split(command)
             proc = subprocess.run(
-                command, shell=True, cwd=workdir, capture_output=True,
+                args, shell=False, cwd=workdir, capture_output=True,
                 text=True, timeout=timeout,
             )
         return _format_result(proc, command, timeout)
 
 
-async def _run(command: str, cwd: str, timeout: float) -> "object":
-    """异步执行命令(在 to_thread 里跑 subprocess.run)。"""
+async def _run(command: str, cwd: str, timeout: float, tokens: Optional[list[str]] = None) -> "object":
+    """异步执行命令(在 to_thread 里跑 subprocess.run)。
+
+    **SEC-3 修复**:使用 ``shell=False`` + ``shlex.split`` 后的 argv 列表,
+    避免 shell 注入。``command`` 参数保留仅为向后兼容日志展示。
+    """
     import subprocess
+    args = tokens if tokens is not None else shlex.split(command)
     return await asyncio.to_thread(
-        subprocess.run, command, shell=True, cwd=cwd,
+        subprocess.run, args, shell=False, cwd=cwd,
         capture_output=True, text=True, timeout=timeout,
     )
 

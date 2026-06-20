@@ -74,13 +74,36 @@ class PlanExecutor:
         self.on_step_done = on_step_done
         self.max_parallel = max(1, max_parallel)
 
-    async def run(self, plan: Plan) -> PlanResult:
+    async def run(
+        self,
+        plan: Plan,
+        *,
+        step_cache: Optional[dict[str, StepResult]] = None,
+    ) -> PlanResult:
+        """执行 plan。
+
+        Args:
+            plan: 要跑的 plan
+            step_cache: **RT-6 修复** — 已完成的 step 直接复用,不重复执行。
+                适用场景:reflection 重试同一 plan 的一部分,
+                已 done 的 step 不应浪费 LLM/tool 调用。
+                key 是 ``step.id``。
+
+        Returns:
+            ``PlanResult``,带 ``step_cache`` 里的 completed steps 合并入 ``result.steps``。
+        """
         errs = plan.validate()
         if errs:
             return PlanResult(plan=plan, finished=False, error="; ".join(errs))
 
         result = PlanResult(plan=plan)
         step_results: dict[str, StepResult] = {}
+        # RT-6:先把 cache 里的已完成结果预填进去
+        if step_cache:
+            for sid, sr in step_cache.items():
+                if sr.status == StepStatus.DONE:
+                    step_results[sid] = sr
+                    result.steps.append(sr)
         failed: Optional[str] = None
 
         for layer in plan.topological_layers():
@@ -90,6 +113,15 @@ class PlanExecutor:
                     sr = StepResult(step_id=s.id, status=StepStatus.SKIPPED)
                     step_results[s.id] = sr
                     result.steps.append(sr)
+                continue
+            # RT-6:同层内若 step 已在 cache 中 done,直接用
+            pending = [s for s in layer if s.id not in step_results]
+            # 把 cache 命中的也标 done
+            for s in layer:
+                if s.id in step_results and step_results[s.id].status == StepStatus.DONE:
+                    if not any(r.step_id == s.id for r in result.steps):
+                        result.steps.append(step_results[s.id])
+            if not pending:
                 continue
             # 同层并发,但限流到 max_parallel。
             # 用 cancel 机制让 critical step 失败时,同层其它 step 能被中断。
@@ -109,8 +141,8 @@ class PlanExecutor:
                     local_failed.append(s.id)
                 return sr
 
-            outs = await asyncio.gather(*[_run_one(s) for s in layer], return_exceptions=False)
-            for s, sr in zip(layer, outs):
+            outs = await asyncio.gather(*[_run_one(s) for s in pending], return_exceptions=False)
+            for s, sr in zip(pending, outs):
                 step_results[s.id] = sr
                 result.steps.append(sr)
                 if self.on_step_done:

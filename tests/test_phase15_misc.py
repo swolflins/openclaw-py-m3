@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -266,7 +267,8 @@ class TestScopedMemory:
             m = ScopedMemory(short_term=sts)
             # 写一段
             sts.append("user:alice", "what's my name?", "alice")
-            turns = m.recent_messages(scope="user:alice", k=10)
+            # RT-1: recent_messages 已改 async
+            turns = asyncio.run(m.recent_messages(scope="user:alice", k=10))
             assert len(turns) == 2
 
 

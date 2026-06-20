@@ -2,13 +2,47 @@
 
 为什么不接 prometheus_client:多一个重量级依赖,这个项目体量不需要。
 我们用 stdlib + 一个简单的 in-memory 计数器自己实现。
+
+**SEC-12 修复 — 标签基数控制**:
+- ``http_requests_total.path`` 用 FastAPI route template(``/v1/chat/{id}``)
+  而非 raw URL(``/v1/chat/123``)→ 防止 unbounded cardinality
+- ``chat_total.session_id`` 在调用方截到 32 字符;``_normalize_session_id`` 再次兜底
+- 新增 ``http_request_size_bytes`` 走 _Histogram(分桶),不做 per-request label
 """
 from __future__ import annotations
 
+import re
 import time
 from collections import defaultdict
 from threading import Lock
 from typing import Dict, Tuple
+
+
+# 匹配长数字 id、UUID、session hash 等,统一归一化为占位符(防止 label 爆炸)
+_HIGH_CARDINALITY_RE = re.compile(
+    r"(\b[0-9a-f]{8,}\b|\b[0-9]{4,}\b|[0-9a-f-]{36})",
+    re.IGNORECASE,
+)
+
+
+def _normalize_path(path: str) -> str:
+    """把高基数路径归一化。
+
+    例子:
+      /v1/chat/abc123def456 → /v1/chat/{id}
+      /v1/users/12345       → /v1/users/{id}
+    """
+    if not path:
+        return path
+    # 不去碰 route template(没有 query string)
+    return _HIGH_CARDINALITY_RE.sub("{id}", path)
+
+
+def _normalize_session_id(sid: str, max_len: int = 32) -> str:
+    """截断 + 兜底归一化,防止把高基数 session_id 灌进 metrics。"""
+    if not sid:
+        return "default"
+    return sid[:max_len]
 
 
 class _Counter:
@@ -18,12 +52,17 @@ class _Counter:
         self.name = name
         self.help = help_
         self.labelnames = labelnames
+        # 防止 label 爆炸:每个 (labelname -> set) 上限 500
+        self._max_cardinality = 500
         self._values: Dict[Tuple[str, ...], float] = defaultdict(float)
         self._lock = Lock()
 
     def inc(self, **labels: str) -> None:
         key = tuple(str(labels.get(n, "")) for n in self.labelnames)
         with self._lock:
+            if len(self._values) >= self._max_cardinality and key not in self._values:
+                # 超过基数上限 → 归一到 __overflow__
+                key = tuple("__overflow__" if _ else "" for _ in key)
             self._values[key] += 1.0
 
     def render(self) -> str:
@@ -64,12 +103,12 @@ class _Gauge:
 
 http_requests_total = _Counter(
     "openclaw_http_requests_total",
-    "HTTP 请求总数(按 method/path/status 分桶)",
+    "HTTP 请求总数(按 method/path(status)/status 分桶)",
     labelnames=("method", "path", "status"),
 )
 chat_total = _Counter(
     "openclaw_chat_total",
-    "Chat 调用总数(按 session_id 分桶)",
+    "Chat 调用总数(按 session_id 分桶,id 截到 32 字符)",
     labelnames=("session_id",),
 )
 chat_errors_total = _Counter(

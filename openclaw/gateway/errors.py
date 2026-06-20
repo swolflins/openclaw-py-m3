@@ -5,6 +5,7 @@
 - HTTPException → 透传(由路由 raise)
 - RequestValidationError → 422 + 简化字段
 - 详细异常 → 写 server log(供调试)
+- **SEC-11 修复**:与 RequestIDMiddleware 共享 request_id,客户端反馈时给一个
 """
 from __future__ import annotations
 
@@ -20,8 +21,8 @@ from openclaw.core.logging import get_logger
 logger = get_logger(__name__)
 
 
-def _err_id() -> str:
-    return uuid.uuid4().hex[:12]
+def _err_id(request: Request) -> str:
+    return getattr(request.state, "request_id", None) or uuid.uuid4().hex[:12]
 
 
 def register_error_handlers(app: FastAPI) -> None:
@@ -37,10 +38,10 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
-        err_id = _err_id()
+        err_id = _err_id(request)
         logger.error(
             "gateway_unhandled_error",
-            error_id=err_id,
+            request_id=err_id,
             path=request.url.path,
             method=request.method,
             exc_type=type(exc).__name__,
@@ -51,6 +52,7 @@ def register_error_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
                 "detail": "internal server error",
-                "error_id": err_id,
+                "request_id": err_id,   # 新名字(SEC-11)
+                "error_id": err_id,     # 旧名字 — 旧测试/客户端兼容
             },
         )

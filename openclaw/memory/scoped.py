@@ -6,9 +6,13 @@ scope 格式: '{kind}:{id}'   例如 'session:abc' / 'user:u1' / 'channel:lark:c
 - 短期 turns (short_term)
 - 长期向量 (long_term, 可选,不存在时跳过)
 - 一站式 retrieve:把长期 + 短期 + SOUL 拼成 messages
+
+**RT-1 修复**:所有 SQLite / ChromaDB / 文件 IO 都通过
+``asyncio.to_thread`` 包装,绝不阻塞事件循环。
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
@@ -55,24 +59,37 @@ class ScopedMemory:
     async def append_turn(
         self, scope: str, user: str, assistant: str, metadata: dict | None = None
     ) -> None:
-        self.short.append(scope, user, assistant, metadata=metadata)
+        # RT-1: 同步 SQLite IO 不能直接调,用 to_thread 包到线程池
+        await asyncio.to_thread(
+            self.short.append, scope, user, assistant, metadata=metadata
+        )
         # 长期记忆:把 assistant 回复(知识性内容)写入
         if self.long is not None and assistant and len(assistant) >= 20:
             try:
-                self.long.add(assistant, scope=scope, metadata={"source": "assistant"})
+                # RT-1 + NEW-2: 同步 ChromaDB IO 也走 to_thread
+                await asyncio.to_thread(
+                    self.long.add,
+                    assistant,
+                    scope=scope,
+                    metadata={"source": "assistant"},
+                )
             except Exception:
                 logger.exception("long_term_add_failed")
 
     # --- 读取 ---
 
-    def recent_messages(self, scope: str, k: int = 20) -> list[ChatMessage]:
-        return self.short.recent(scope, k=k)
+    async def recent_messages(self, scope: str, k: int = 20) -> list[ChatMessage]:
+        # RT-1: 同步 IO 走 to_thread
+        return await asyncio.to_thread(self.short.recent, scope, k=k)
 
-    def recall(self, scope: str, query: str, top_k: int = 5) -> list[MemoryItem]:
+    async def recall(self, scope: str, query: str, top_k: int = 5) -> list[MemoryItem]:
         if self.long is None:
             return []
         try:
-            return self.long.query(query, scope=scope, top_k=top_k)
+            # RT-1: ChromaDB query 同步 → 异步
+            return await asyncio.to_thread(
+                self.long.query, query, scope=scope, top_k=top_k
+            )
         except Exception:
             logger.exception("long_term_query_failed")
             return []
@@ -84,7 +101,7 @@ class ScopedMemory:
 
     # --- 一站式:组装给 LLM 的 messages ---
 
-    def build_messages(
+    async def build_messages(
         self,
         scope: str,
         user_message: str,
@@ -93,13 +110,16 @@ class ScopedMemory:
         history_window: int = 20,
         recall_top_k: int = 3,
     ) -> list[ChatMessage]:
-        """拼装: [soul-augmented-system, recalled-context, history..., user]。"""
+        """拼装: [soul-augmented-system, recalled-context, history..., user]。
+
+        **RT-1 修复**:此方法已改 async,所有底层 IO 异步化。
+        """
         system = self.render_system_prompt(base=system_prompt)
 
         msgs: list[ChatMessage] = [ChatMessage(role="system", content=system)]
 
-        # 长期记忆检索 -> 拼成 system reminder(放在 system 之后)
-        recalled = self.recall(scope, user_message, top_k=recall_top_k)
+        # 长期记忆检索(异步)— 拼成 system reminder
+        recalled = await self.recall(scope, user_message, top_k=recall_top_k)
         if recalled:
             lines = ["以下是与用户当前问题相关的历史记忆,请参考回答(不要直接复读):"]
             for i, item in enumerate(recalled, 1):
@@ -109,8 +129,9 @@ class ScopedMemory:
                 ChatMessage(role="system", content="\n".join(lines))
             )
 
-        # 短期历史
-        msgs.extend(self.short.recent(scope, k=history_window))
+        # 短期历史(异步)
+        history = await self.recent_messages(scope, k=history_window)
+        msgs.extend(history)
         # 当前问题
         msgs.append(ChatMessage(role="user", content=user_message))
         return msgs

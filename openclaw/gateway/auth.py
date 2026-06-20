@@ -38,6 +38,36 @@ _PUBLIC_PREFIXES = (
 )
 _PUBLIC_EXACT = {"/", ""}
 
+# NEW-1:环境变量名 — 当值为 "production" / "prod" 时强制要求 token
+_ENV_VAR = "OPENCLAW_GATEWAY_ENV"
+_PROD_VALUES = {"production", "prod"}
+
+
+def is_production_mode() -> bool:
+    """NEW-1:返回当前是否处于生产模式。"""
+    return os.environ.get(_ENV_VAR, "").strip().lower() in _PROD_VALUES
+
+
+def require_token_in_production() -> None:
+    """NEW-1:生产模式下,启动时若无 token 则**直接抛错,拒绝启动**。
+
+    dev / test 模式下不抛错(只 warning),保持向后兼容。
+    """
+    if not is_production_mode():
+        return
+    cfg = _configured_tokens()
+    if not cfg:
+        raise RuntimeError(
+            f"[NEW-1] 检测到 {_ENV_VAR}=production,但 OPENCLAW_GATEWAY_TOKEN 未设置。"
+            "为防止未鉴权部署,启动被拒绝。请设置: "
+            "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+        )
+    if any(len(t) < 16 for t in cfg):
+        # 太短的 token 即使配置了也警告,但不阻断(避免误杀)
+        logger.warning(
+            "gateway_token_too_short:检测到生产环境 token 长度 < 16,建议改用 secrets.token_urlsafe(32)"
+        )
+
 
 def _is_public(path: str) -> bool:
     """判断 path 是否在白名单(无需 token)。"""
