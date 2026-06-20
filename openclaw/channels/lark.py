@@ -19,6 +19,27 @@ from openclaw.config.settings import LarkSettings
 
 logger = logging.getLogger(__name__)
 
+
+def _is_bot_mentioned(mentions: Optional[list], bot_open_id: Optional[str]) -> bool:
+    """CH-1:判断飞书事件里是否 @ 了 bot。
+
+    mentions 是 lark_oapi MentionEvent 列表,任一满足:
+    - mentioned_type == "bot"(明确是 bot)
+    - id.open_id 等于 bot 自己的 open_id
+    即认为被 @。
+    """
+    if not mentions:
+        return False
+    for m in mentions:
+        try:
+            if getattr(m, "mentioned_type", None) == "bot":
+                return True
+            if bot_open_id and getattr(getattr(m, "id", None), "open_id", None) == bot_open_id:
+                return True
+        except Exception:
+            continue
+    return False
+
 try:  # 飞书 SDK 可选依赖
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
@@ -98,11 +119,51 @@ class LarkChannel(BaseChannel):
             return
         await self._reply_to_lark(message_id, text)
 
+    def _fetch_bot_open_id(self) -> Optional[str]:
+        """CH-1:拉一次 bot 自己的 open_id(缓存到 self._bot_open_id)。
+
+        用 im/v1/bot_info 接口。失败返回 None(不致命 — 群 @ 检测会回退到 mentioned_type)。
+        """
+        if getattr(self, "_bot_open_id", None):
+            return self._bot_open_id
+        try:
+            import httpx
+            import asyncio
+            token = asyncio.run(self._get_tenant_token())
+            if not token:
+                return None
+            r = httpx.get(
+                "https://open.feishu.cn/open-apis/im/v1/bots/me",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            data = r.json()
+            bot = data.get("data", {}).get("bot", {})
+            open_id = bot.get("open_id")
+            if open_id:
+                self._bot_open_id = open_id
+                logger.info("Lark bot open_id 缓存: %s", open_id)
+            return open_id
+        except Exception:
+            logger.exception("fetch bot open_id failed")
+            return None
+
     # ---------- 内部实现 ----------
 
     async def _ws_loop(self) -> None:
-        """在独立线程跑飞书 WS 客户端。"""
+        """在独立线程跑飞书 WS 客户端,带崩溃重连(REL-1)。
+
+        旧实现:ws_client.start() 一旦抛异常,_ws_loop 退出,channel 永远静默。
+        新实现:
+        - 用外层 try/except 包住 start()
+        - 退避重连:1s, 2s, 4s, 8s, 16s, 30s(上限)
+        - 收到 _stopped 后干净退出
+        - 连续 N 次失败后停止重连(让上层可以重启)
+        """
         loop = asyncio.get_running_loop()
+        backoffs = [1, 2, 4, 8, 16, 30]
+        max_attempts = 12  # 约 2 分钟后停止重连(让运维介入)
+        attempt = 0
 
         def _on_message(data: Any) -> None:
             try:
@@ -111,22 +172,48 @@ class LarkChannel(BaseChannel):
             except Exception:
                 logger.exception("解析飞书事件失败")
 
-        # 构造事件处理器
         handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(_on_message)
             .build()
         )
 
-        self._ws_client = lark.ws.Client(
-            self.settings.app_id,
-            self.settings.app_secret,
-            event_handler=handler,
-            log_level=lark.LogLevel.INFO,
-        )
+        while not self._stopped.is_set():
+            self._ws_client = lark.ws.Client(
+                self.settings.app_id,
+                self.settings.app_secret,
+                event_handler=handler,
+                log_level=lark.LogLevel.INFO,
+            )
+            try:
+                # 阻塞;期间 _stopped.set() 后 ws_client.stop() 会让 start() 返回
+                await loop.run_in_executor(None, self._ws_client.start)
+                # 正常退出(被 stop())→ 不重连
+                if self._stopped.is_set():
+                    return
+                # 否则可能是意外退出
+                logger.warning("Lark WS 客户端意外退出,准备重连")
+            except Exception:
+                logger.exception("Lark WS 崩溃,准备重连")
+            finally:
+                self._ws_client = None
 
-        # 启动(阻塞)
-        await loop.run_in_executor(None, self._ws_client.start)
+            attempt += 1
+            if attempt > max_attempts:
+                logger.error(
+                    "Lark WS 重连超上限(%d 次),停止重连(请人工检查凭据 / 网络)",
+                    max_attempts,
+                )
+                return
+
+            delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+            logger.info("Lark WS 第 %d 次重连,等 %ds", attempt, delay)
+            # 可中断 sleep
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=delay)
+                return  # 期间被 stop()
+            except asyncio.TimeoutError:
+                pass
 
     async def _handle_event(self, evt: Any) -> None:
         """处理一条飞书消息事件。"""
@@ -145,6 +232,10 @@ class LarkChannel(BaseChannel):
             if message_id:
                 # send() 内部用这个 reply 原消息
                 self._last_msg_id[session_id] = message_id
+            # CH-1:解析 mentions;若 mention 列表里有 bot 自己的 open_id 则 mentioned=True
+            is_dm = (getattr(msg, "chat_type", "") == "p2p")
+            bot_open_id = getattr(self, "_bot_open_id", None) or self._fetch_bot_open_id()
+            mentioned = _is_bot_mentioned(getattr(msg, "mentions", None), bot_open_id)
             # 走统一管道(经过 AutoReply)
             await self.dispatch(IncomingMessage(
                 channel=self.name,
@@ -153,8 +244,8 @@ class LarkChannel(BaseChannel):
                 text=text,
                 raw=msg,
                 metadata={
-                    "is_dm": getattr(msg, "chat_type", "") == "p2p",
-                    "mentioned": False,  # 飞书未解析 mentions
+                    "is_dm": is_dm,
+                    "mentioned": mentioned,
                     "chat_id": chat_id,
                     "message_id": message_id,
                 },

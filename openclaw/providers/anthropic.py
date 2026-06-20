@@ -7,6 +7,7 @@ Anthropic 工具协议:
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any, Optional
 
@@ -37,13 +38,45 @@ class AnthropicProvider(BaseLLMProvider):
         except ImportError as e:
             raise ProviderError("anthropic 包未安装,运行 `pip install anthropic`") from e
 
-        self._client = AsyncAnthropic(api_key=api_key, base_url=base_url) if base_url else AsyncAnthropic(api_key=api_key)
+        self._client: Optional[AsyncAnthropic] = None
+        self._client_loop_id: Optional[int] = None
+
+    async def _get_client(self) -> Any:
+        """RT-3:在每个 event loop 首次调用时懒建 client,避免跨 loop 复用。"""
+        try:
+            current_loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            current_loop_id = -1
+        if (
+            self._client is not None
+            and self._client_loop_id == current_loop_id
+        ):
+            return self._client
+        # 旧 client(若还活着)先关
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+        kwargs: dict[str, Any] = {"api_key": self.api_key}
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        # 避免 import 时未装 anthropic SDK
+        try:
+            from anthropic import AsyncAnthropic
+        except ImportError as e:
+            raise ProviderError("anthropic 未安装,运行 `pip install anthropic`") from e
+        self._client = AsyncAnthropic(**kwargs)
+        self._client_loop_id = current_loop_id
+        return self._client
 
     async def aclose(self) -> None:
-        try:
-            await self._client.close()
-        except Exception:
-            pass
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+            self._client = None
 
     async def acomplete(
         self,
@@ -73,7 +106,8 @@ class AnthropicProvider(BaseLLMProvider):
             ]
 
         try:
-            resp = await self._client.messages.create(**kwargs)
+            client = await self._get_client()
+            resp = await client.messages.create(**kwargs)
         except Exception as e:
             raise ProviderError(f"Anthropic 调用失败: {e!r}") from e
 

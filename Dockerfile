@@ -34,15 +34,9 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY openclaw ./openclaw
 
-# 装运行依赖(gateway / redis / apscheduler / docker)
-RUN pip install --no-cache-dir \
-        "fastapi>=0.110" "uvicorn>=0.29" "sse-starlette>=2.0" \
-        "redis>=5.0" "apscheduler>=3.10" "pydantic>=2.6" \
-        "pydantic-settings>=2.2" "structlog>=24.1" \
-        "httpx>=0.27" "rich>=13.7" "typer>=0.12" \
-        "watchdog>=4.0" "orjson>=3.10" "tenacity>=8.2" \
-        "pyyaml>=6.0" "aiofiles>=23.2" \
-    && pip install --no-cache-dir --no-deps . 2>/dev/null || true
+# 装运行依赖(server + redis + scheduler + fs-watch)
+# ENG-1:不要 --no-deps || true(掩盖真实错误),让 pip 装所有 extras
+RUN pip install --no-cache-dir --no-build-isolation ".[server,redis,scheduler,fs-watch]"
 
 # ---------- runtime ----------
 FROM python:${PYTHON_VERSION}-slim AS runtime
@@ -90,5 +84,5 @@ CMD ["uvicorn", "openclaw.gateway.app:app", \
      "--host", "0.0.0.0", \
      "--port", "8080", \
      "--proxy-headers", \
-     "--forwarded-allow-ips", "*", \
+     "--forwarded-allow-ips", "127.0.0.1,::1", \
      "--log-level", "info"]

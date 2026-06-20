@@ -41,13 +41,16 @@ class RateLimiter:
         rate: float = 1.0,
         burst: int = 5,
         persist_path: Optional[Path] = None,
+        max_keys: int = 100_000,
     ) -> None:
+        """max_keys: SEC-12 防御 — 防恶意 / 异常 user_id 填爆内存。超过上限时拒绝新 key 创建。"""
         if rate <= 0:
             raise ValueError("rate must be > 0")
         if burst <= 0:
             raise ValueError("burst must be > 0")
         self.rate = float(rate)
         self.burst = float(burst)
+        self.max_keys = int(max_keys)
         self._buckets: dict[str, _Bucket] = {}
         self._lock = threading.Lock()
         self._persist_path = persist_path
@@ -94,6 +97,12 @@ class RateLimiter:
         now = time.time()
         b = self._buckets.get(key)
         if b is None:
+            # SEC-12:达到 max_keys 上限,先 LRU 淘汰最久未活动的 key
+            if len(self._buckets) >= self.max_keys and key not in self._buckets:
+                self._evict_lru()
+            # 仍满 → 拒(返回当前 burst 的全新 bucket,但不写)
+            if len(self._buckets) >= self.max_keys and key not in self._buckets:
+                return _Bucket(tokens=self.burst, last_refill=now)
             b = _Bucket(tokens=self.burst, last_refill=now)
             self._buckets[key] = b
         else:
@@ -102,6 +111,22 @@ class RateLimiter:
                 b.tokens = min(self.burst, b.tokens + elapsed * self.rate)
                 b.last_refill = now
         return b
+
+    def _evict_lru(self) -> None:
+        """SEC-12:LRU 淘汰:踢掉 last_refill 最早的 bucket(10% 留缓冲)。"""
+        if not self._buckets:
+            return
+        # 淘汰 10%
+        evict_count = max(1, self.max_keys // 10)
+        sorted_keys = sorted(
+            self._buckets.items(), key=lambda kv: kv[1].last_refill
+        )[:evict_count]
+        for k, _ in sorted_keys:
+            self._buckets.pop(k, None)
+            if self._db is not None:
+                self._db.execute("DELETE FROM rl_bucket WHERE key = ?", (k,))
+        if self._db is not None:
+            self._db.commit()
 
     def _consume(self, key: str, cost: float) -> bool:
         b = self._refill(key)

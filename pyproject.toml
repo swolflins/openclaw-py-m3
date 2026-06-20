@@ -11,6 +11,8 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "openclaw-py contributors" }]
 keywords = ["ai", "agent", "llm", "openclaw", "feishu", "lark", "telegram"]
+# 核心 runtime 依赖:不依赖任何 LLM / 特定 channel / 特定存储
+# provider / channel / memory backend 都是可选 extras
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.6",
@@ -18,34 +20,51 @@ dependencies = [
     "python-dotenv>=1.0",
     "rich>=13.7",
     "typer>=0.12",
-    "aiofiles>=23.2",
-    "lark-oapi>=1.2",
     "pyyaml>=6.0",
     "tomli>=2.0; python_version<'3.11'",
-    "watchdog>=4.0",
     "orjson>=3.10",
     "tenacity>=8.2",
-    "anthropic>=0.30",
-    "google-generativeai>=0.8",
-    "chromadb>=0.5",
     "structlog>=24.1",
 ]
 
 [project.optional-dependencies]
+# LLM providers(都可选)
+openai = []                              # openai_compat 走 httpx 即可,无需 SDK
+anthropic = ["anthropic>=0.30"]
+gemini = ["google-generativeai>=0.8"]
+all-providers = ["openclaw-py[anthropic,gemini]"]
+
+# Channel adapters
+lark = ["lark-oapi>=1.2"]
+all-channels = ["openclaw-py[lark]"]
+
+# Memory backends
+chroma = ["chromadb>=0.5"]
+sqlite-vec = []                           # 走 stdlib sqlite3,无需 extra
+all-memory = ["openclaw-py[chroma]"]
+
+# API server
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "sse-starlette>=2.0",
+]
+
+# 杂项
+redis = ["redis>=5.0"]
+docker = ["docker>=7.1"]
+playwright = ["playwright>=1.44"]
+scheduler = ["apscheduler>=3.10"]
+fs-watch = ["watchdog>=4.0", "aiofiles>=23.2"]
+
+# 聚合
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
-    "httpx>=0.27",
 ]
 all = [
-    "playwright>=1.44",
-    "docker>=7.1",
-    "apscheduler>=3.10",
-    "fastapi>=0.110",
-    "uvicorn>=0.29",
-    "sse-starlette>=2.0",
-    "redis>=5.0",
+    "openclaw-py[all-providers,all-channels,all-memory,server,redis,docker,scheduler,playwright,fs-watch]",
 ]
 
 [project.scripts]

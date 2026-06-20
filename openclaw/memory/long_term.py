@@ -46,6 +46,7 @@ class LongTermStore:
         dir_path: Path | str,
         collection: str = "openclaw_memory",
         embedding_fn: Optional[EmbeddingFn] = None,
+        max_items: int = 0,  # MEM-4:0 = 不限;非 0 = LRU 上限(单 collection 总量)
     ) -> None:
         if not _HAS_CHROMADB:
             raise RuntimeError(
@@ -53,6 +54,7 @@ class LongTermStore:
             )
         self.dir = Path(dir_path)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self.max_items = int(max_items)
         self._lock = threading.Lock()
         self._client = chromadb.PersistentClient(
             path=str(self.dir),
@@ -83,12 +85,43 @@ class LongTermStore:
         metadata: dict[str, Any] | None = None,
         item_id: str | None = None,
     ) -> str:
+        if not text or not text.strip():
+            return ""
         md = dict(metadata or {})
         md["scope"] = scope
         iid = item_id or f"mem_{uuid.uuid4().hex[:12]}"
         with self._lock:
+            # MEM-5:空 text 已上一步拒,这里不重检
+            # MEM-4:超过 max_items → LRU 淘汰(按 metadata['_ts'])
+            if self.max_items and self._count() >= self.max_items:
+                self._evict_oldest(scope, keep=self.max_items * 9 // 10)
             self._collection.add(documents=[text], metadatas=[md], ids=[iid])
         return iid
+
+    def _count(self) -> int:
+        try:
+            return self._collection.count()
+        except Exception:
+            return 0
+
+    def _evict_oldest(self, scope: str, *, keep: int) -> None:
+        """MEM-4:LRU 淘汰:按 metadata['_ts'] 升序删除到 keep 条。"""
+        try:
+            data = self._collection.get(where={"scope": scope}, limit=10_000)
+            ids = data.get("ids") or []
+            metas = data.get("metadatas") or []
+            order = sorted(
+                range(len(ids)),
+                key=lambda i: (metas[i] or {}).get("_ts", 0) or 0,
+            )
+            evict = max(0, len(order) - keep)
+            for i in order[:evict]:
+                try:
+                    self._collection.delete(ids=[ids[i]])
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("evict_oldest failed")
 
     def query(
         self,

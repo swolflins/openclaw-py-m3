@@ -3,18 +3,71 @@
 - 系统提示 = 配置 system_prompt + SOUL 文档
 - 消息 = soul-augmented system + recalled context + 短期 history + user
 - 完成后写回短期(per session_id),把 assistant 回复索引到长期
+
+RT-4:支持历史窗口裁剪(防 token 爆)。
 """
 from __future__ import annotations
 
-import logging
 import uuid
 from dataclasses import dataclass
 
+from openclaw.core.logging import get_logger
 from openclaw.llm.base import BaseLLMProvider, ChatMessage, ToolCall
 from openclaw.memory.scoped import ScopedMemory
 from openclaw.tools.registry import ToolRegistry
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+def trim_history(
+    messages: list[ChatMessage],
+    *,
+    soft_window: int,
+    max_chars: int,
+) -> list[ChatMessage]:
+    """RT-4:在多轮 ReAct 后裁剪 messages,防 token 爆。
+
+    规则:
+    1. 保留 system 消息(假定 0 位置是 system)
+    2. 数量 ≤ soft_window 且字符 ≤ max_chars → 原样
+    3. 否则:system + 头部 N 旧 + 中间 1 条 note + 最新 M
+    """
+    if not messages:
+        return messages
+
+    total_chars = sum(len(m.content or "") for m in messages)
+    if len(messages) <= soft_window and total_chars <= max_chars:
+        return messages
+
+    system_msg: ChatMessage | None = None
+    body: list[ChatMessage] = []
+    if messages and messages[0].role == "system":
+        system_msg = messages[0]
+        body = messages[1:]
+    else:
+        body = list(messages)
+
+    if len(body) > soft_window:
+        head_n = max(1, soft_window // 3)
+        tail_n = max(1, soft_window - head_n - 1)
+        kept_head = body[:head_n]
+        kept_tail = body[-tail_n:]
+        note = ChatMessage(
+            role="system",
+            content=f"[trimmed: {len(body) - head_n - tail_n} older messages collapsed to save context]",
+        )
+        body = kept_head + [note] + kept_tail
+
+    cur_chars = sum(len(m.content or "") for m in body) + (len(system_msg.content) if system_msg else 0)
+    while cur_chars > max_chars and len(body) > 2:
+        body.pop(0)
+        cur_chars = sum(len(m.content or "") for m in body) + (len(system_msg.content) if system_msg else 0)
+
+    if system_msg:
+        return [system_msg] + body
+    return body
+
+
 
 
 @dataclass
@@ -39,6 +92,9 @@ class Agent:
         system_prompt: str = "",
         max_tool_iterations: int = 8,
         history_window: int = 20,
+        history_max_chars: int = 200_000,
+        # 软窗口:超过后裁剪掉"中间"的历史(保留 system + 最新 N 轮)
+        history_soft_window: int = 40,
         recall_top_k: int = 3,
     ) -> None:
         self.llm = llm
@@ -48,6 +104,8 @@ class Agent:
         self.system_prompt = system_prompt
         self.max_tool_iterations = max_tool_iterations
         self.history_window = history_window
+        self.history_max_chars = history_max_chars
+        self.history_soft_window = history_soft_window
         self.recall_top_k = recall_top_k
 
     async def run(self, user_message: str) -> AgentResponse:
@@ -65,6 +123,12 @@ class Agent:
 
         for i in range(self.max_tool_iterations):
             iterations += 1
+            # RT-4:每次送 LLM 前裁剪历史,防 token 爆
+            messages = trim_history(
+                messages,
+                soft_window=self.history_soft_window,
+                max_chars=self.history_max_chars,
+            )
             logger.debug("[agent %s] iter=%d send to LLM, %d msgs", self.session_id, i, len(messages))
             result = await self.llm.acomplete(messages, tools=self.tools.specs())
 
@@ -124,6 +188,8 @@ class AgentLoop:
         system_prompt: str = "",
         max_tool_iterations: int = 8,
         history_window: int = 20,
+        history_max_chars: int = 200_000,
+        history_soft_window: int = 40,
         recall_top_k: int = 3,
     ) -> None:
         self.llm = llm
@@ -132,6 +198,8 @@ class AgentLoop:
         self.system_prompt = system_prompt
         self.max_tool_iterations = max_tool_iterations
         self.history_window = history_window
+        self.history_max_chars = history_max_chars
+        self.history_soft_window = history_soft_window
         self.recall_top_k = recall_top_k
         self._agents: dict[str, Agent] = {}
 

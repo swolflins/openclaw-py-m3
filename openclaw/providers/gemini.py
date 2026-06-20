@@ -29,8 +29,16 @@ class GeminiProvider(BaseLLMProvider):
             import google.generativeai as genai
         except ImportError as e:
             raise ProviderError("google-generativeai 未安装,运行 `pip install google-generativeai`") from e
-        genai.configure(api_key=api_key)
+        # RT-2:不要 genai.configure() 全局副作用(多 key / 多实例会污染全局);
+        # 用 genai.Client 拿到 client,把 api_key 放在构造里
         self._genai = genai
+        # 新 SDK 推荐 client 模式;老 SDK 用 GenerativeModel 配 client_options
+        try:
+            self._client = genai.Client(api_key=api_key)
+        except (TypeError, AttributeError):
+            # 旧版 SDK(没有 Client)→ 退而用 configure + 配 client_options
+            self._client = None
+            genai.configure(api_key=api_key)
         self._model: Any = None
 
     def _get_model(self, tools: Optional[list[ToolSpec]] = None) -> Any:
@@ -44,6 +52,10 @@ class GeminiProvider(BaseLLMProvider):
                 )
                 for t in tools
             ]
+        if self._client is not None:
+            # 新 SDK:client.aio.models.generate_content 走 aio client,
+            # 但 chat 模式仍用 GenerativeModel,只是 model 不绑全局 api key
+            return self._genai.GenerativeModel(self.model, tools=tool_decls)
         return self._genai.GenerativeModel(self.model, tools=tool_decls)
 
     @staticmethod

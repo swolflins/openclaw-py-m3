@@ -48,6 +48,8 @@ class AutoReplyConfig:
     auto_in_dm: bool = True
     # 是否在群聊中被 @ 时触发(从 metadata 读 "mentioned")
     auto_when_mentioned: bool = True
+    # CH-2:user-level allowFrom 白名单 — None/空 = 不限制;非空 = 只允许列表中的 user_id
+    allow_from: list[str] = field(default_factory=list)
     # 限流(每个 key 一行)
     rate_per_user: Optional[RateLimiter] = None
     rate_per_channel: Optional[RateLimiter] = None
@@ -118,6 +120,11 @@ class AutoReplyManager:
         meta = metadata or {}
         cfg = self.cfg
         now = now or _dt.datetime.now()
+
+        # 0) CH-2:user allowFrom 白名单(空 = 不限制;非空 = 只放行列表中的 user_id)
+        if cfg.allow_from and user_id not in cfg.allow_from:
+            self._stats["block_allow_from"] = self._stats.get("block_allow_from", 0) + 1
+            return AutoReplyDecision(False, reason=f"user {user_id} not in allow_from")
 
         # 1) 黑名单
         for rx in self._blk_re:
