@@ -86,6 +86,39 @@ def test_docker_register_has_hardening_kwargs():
     assert params["no_new_privileges"].default is True
 
 
+# ─────────────── TOOL 优化 — 镜像白名单 ───────────────
+def test_docker_image_allowlist_blocks_disallowed():
+    """TOOL 优化:不在白名单的镜像应被拒绝。"""
+    from openclaw.core.errors import ToolError
+    from openclaw.tools.builtin.docker import _check_image_allowed, _DEFAULT_ALLOWED_IMAGES
+
+    # 白名单内 → 通过
+    _check_image_allowed("python:3.11-slim", _DEFAULT_ALLOWED_IMAGES)
+    _check_image_allowed("alpine:3.20", _DEFAULT_ALLOWED_IMAGES)
+    # 非法格式 → 拒绝
+    with pytest.raises(ToolError, match="格式非法"):
+        _check_image_allowed("", _DEFAULT_ALLOWED_IMAGES)
+    with pytest.raises(ToolError, match="格式非法"):
+        _check_image_allowed("evil; rm -rf /", _DEFAULT_ALLOWED_IMAGES)
+    # 不在白名单 → 拒绝
+    with pytest.raises(ToolError, match="不在白名单"):
+        _check_image_allowed("malware/cryptominer:latest", _DEFAULT_ALLOWED_IMAGES)
+    with pytest.raises(ToolError, match="不在白名单"):
+        _check_image_allowed("python:2.7", _DEFAULT_ALLOWED_IMAGES)
+
+
+def test_docker_register_has_allowlist_param():
+    """TOOL 优化:register_docker_tools 应有 allowed_images / enforce_allowlist 参数。"""
+    from openclaw.tools.builtin import docker as docker_mod
+
+    sig = inspect.signature(docker_mod.register_docker_tools)
+    params = sig.parameters
+    assert "allowed_images" in params
+    assert "enforce_allowlist" in params
+    # 默认应该开启
+    assert params["enforce_allowlist"].default is True
+
+
 # ─────────────── NEW-1 ───────────────
 def test_production_mode_requires_token(monkeypatch):
     """NEW-1:OPENCLAW_GATEWAY_ENV=production 且无 token → create_app 抛 RuntimeError。"""
@@ -171,6 +204,46 @@ def test_router_uses_tenacity_retry():
     assert "AsyncRetrying" in src
     assert "stop_after_attempt" in src
     assert "wait_exponential" in src
+
+
+# ─────────────── ENG 优化:pip-audit 硬失败 ───────────────
+def test_pip_audit_yml_hard_fails_on_cve():
+    """ENG 优化:CI 的 pip-audit 步骤必须 '有 CVE 时 exit 1'(硬失败)。"""
+    import re
+    from pathlib import Path
+
+    yml = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    # 必须有:发现 CVE 时 exit 1(硬失败)
+    assert "exit 1" in yml, "pip-audit 应在发现 CVE 时硬失败(exit 1),不能只 warning"
+    # 抓 Run pip-audit 步骤的 run 块(到下一个 step 之前)
+    m = re.search(r"Run pip-audit.*?run: \|\n(.*?)(?=\n      - |\Z)", yml, re.DOTALL)
+    assert m is not None, "找不到 pip-audit 步骤"
+    run_block = m.group(1)
+    # 关键:pip-audit 行捕获退出码,不能无脑 '|| true' 短路
+    assert "pip-audit --strict" in run_block
+    assert "AUDIT_EXIT" in run_block or "exit 1" in run_block
+    # '|| true' 这种"忽略错误"的语法不应再出现在 run 块里
+    assert "|| true" not in run_block, f"pip-audit run 块里还有 '|| true' 短路:{run_block!r}"
+
+
+# ─────────────── RT-8 续:executor 重试退避 ───────────────
+def test_executor_retry_has_backoff():
+    """RT-8 续:PlanExecutor._exec_step 重试分支必须 await asyncio.sleep(退避)。"""
+    from openclaw.agent import executor as ex
+
+    src = inspect.getsource(ex.PlanExecutor._exec_step)
+    # 必须有 sleep + backoff 字样
+    assert "asyncio.sleep" in src, "executor._exec_step 仍无退避 sleep,会被毫秒级连发"
+    assert "backoff" in src or "0.1" in src or "min(1.0" in src
+
+
+def test_executor_imports_random_for_jitter():
+    """RT-8 续:executor 引入 random 用于抖动。"""
+    import openclaw.agent.executor as ex
+    import random as _random
+    assert hasattr(ex, "random"), "executor 缺 random 模块(用于 jitter)"
+    # 确认是同源
+    assert ex.random is _random
 
 
 # ─────────────── SEC-3 shell 安全 ───────────────

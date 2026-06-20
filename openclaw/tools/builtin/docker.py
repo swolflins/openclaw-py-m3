@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import re
 
 from openclaw.core.errors import ToolError
 from openclaw.core.logging import get_logger
@@ -23,6 +24,44 @@ try:
 except Exception:  # pragma: no cover
     docker = None  # type: ignore[assignment]
     _HAS_DOCKER = False
+
+
+# TOOL 优化:镜像白名单 — 防止 agent 拉恶意 / 不合规镜像
+# 解析:取 ``repo[:tag]`` 的 repo 部分(忽略 registry),case-insensitive
+_DEFAULT_ALLOWED_IMAGES: tuple[str, ...] = (
+    "python:3.11-slim",
+    "python:3.12-slim",
+    "python:3.13-slim",
+    "alpine:3.19",
+    "alpine:3.20",
+    "alpine:latest",
+    "debian:12-slim",
+    "ubuntu:24.04",
+)
+
+# 简易镜像名校验:防止注入 docker CLI 参数
+_IMAGE_NAME_RE = re.compile(
+    r"^[a-zA-Z0-9][a-zA-Z0-9._\-/]{0,127}(?::[a-zA-Z0-9._\-]{1,64})?$"
+)
+
+
+def _check_image_allowed(image: str, allowed: tuple[str, ...]) -> None:
+    """TOOL 优化:校验镜像名格式 + 是否在白名单。
+
+    白名单匹配是**前缀匹配**:`python:3.11-slim` 允许 `python:3.11-slim` / `python:3.11`。
+    """
+    if not image or not _IMAGE_NAME_RE.match(image):
+        raise ToolError(
+            f"docker: 镜像名格式非法 {image!r}(只允许字母数字 + . _ - / :)"
+        )
+    img_norm = image.lower()
+    for ok in allowed:
+        ok_norm = ok.lower()
+        if img_norm == ok_norm or img_norm.startswith(ok_norm + ":") or img_norm.startswith(ok_norm + "/"):
+            return
+    raise ToolError(
+        f"docker: 镜像 {image!r} 不在白名单 {list(allowed)} 内"
+    )
 
 
 def _ensure_docker() -> None:
@@ -46,6 +85,8 @@ def register_docker_tools(
     run_as_user: str = "65534",    # TOOL-1:以 nobody 运行(防 root 提权)
     cap_drop: tuple[str, ...] = ("ALL",),  # TOOL-1:丢掉所有 capabilities
     no_new_privileges: bool = True,  # TOOL-1:禁 SUID/SGID 提权
+    allowed_images: tuple[str, ...] = _DEFAULT_ALLOWED_IMAGES,  # TOOL 优化:白名单
+    enforce_allowlist: bool = True,  # TOOL 优化:False 可关闭(用于本地实验)
 ) -> None:
     """注册 docker_* 工具(都属 ADMIN 权限,需要审批)。
 
@@ -74,11 +115,18 @@ def register_docker_tools(
             kw["cpu_period"] = cpu_period
         return kw
 
+    def _resolve_image(image: str) -> str:
+        """TOOL 优化:白名单校验 + 默认值回退。"""
+        img = image or default_image
+        if enforce_allowlist:
+            _check_image_allowed(img, allowed_images)
+        return img
+
     @registry.tool(category=ToolCategory.SANDBOX, permission=ToolPermission.ADMIN)
     def docker_run_python(code: str, image: str = "") -> str:
         """在临时 Python 容器里跑一段代码并返回 stdout。code: Python 源码; image: 镜像,默认 python:3.11-slim。"""
         _ensure_docker()
-        img = image or default_image
+        img = _resolve_image(image)
         client = docker.from_env()
         try:
             container = client.containers.run(
@@ -108,7 +156,7 @@ def register_docker_tools(
     def docker_exec(command: str, image: str = "") -> str:
         """在临时容器里跑一条 shell 命令并返回结果。command: 完整命令; image: 镜像。"""
         _ensure_docker()
-        img = image or default_image
+        img = _resolve_image(image)
         client = docker.from_env()
         try:
             container = client.containers.run(
@@ -136,9 +184,11 @@ def register_docker_tools(
     def docker_pull(image: str) -> str:
         """预拉取镜像。image: 镜像名如 python:3.12。"""
         _ensure_docker()
+        # TOOL 优化:即使是显式 pull 也要走白名单
+        img = _resolve_image(image)
         client = docker.from_env()
-        client.images.pull(image)
-        return f"pulled {image}"
+        client.images.pull(img)
+        return f"pulled {img}"
 
     @registry.tool(category=ToolCategory.SANDBOX, permission=ToolPermission.READ)
     def docker_list_images() -> str:

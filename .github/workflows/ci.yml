@@ -70,14 +70,28 @@ jobs:
       - name: Install pip-audit
         run: pip install pip-audit
 
-      # ENG-3:扫描依赖已知漏洞;高危 CVE 直接 fail,中低危只警告
+      # ENG-3 续:扫描依赖已知漏洞
+      # - 高危 / 严重 CVE → 硬失败(阻断 merge)
+      # - 解析失败 / 网络问题 → 软失败(只 warning,避免误杀)
       - name: Run pip-audit
+        id: pip-audit
         run: |
-          pip-audit --strict --no-deps 2>&1 | tee /tmp/audit.log || true
-          HIGH=$(grep -E "^(ID|Name)" /tmp/audit.log | wc -l || echo 0)
-          echo "audit_done"
-          if grep -qE "^(ID|Name)" /tmp/audit.log; then
-            echo "::warning::pip-audit 报告了依赖漏洞,见 /tmp/audit.log"
+          set -u
+          # 用 || AUDIT_EXIT=$? 捕获 pip-audit 退出码(0=无漏洞,非 0=有 CVE 或执行失败)
+          pip-audit --strict --no-deps > /tmp/audit.log 2>&1 || AUDIT_EXIT=$?
+          AUDIT_EXIT=${AUDIT_EXIT:-0}
+          echo "audit_exit=$AUDIT_EXIT"
+          # 退出码 0 = 无漏洞;非 0 = 有漏洞或出错
+          if [ "$AUDIT_EXIT" -ne 0 ]; then
+            echo "::group::pip-audit 报告"
+            cat /tmp/audit.log
+            echo "::endgroup::"
+            if grep -qE "^ID " /tmp/audit.log; then
+              echo "::error::pip-audit 发现依赖 CVE,见 /tmp/audit.log — 阻断 merge"
+              exit 1
+            else
+              echo "::warning::pip-audit 执行失败(网络 / 解析),不阻断"
+            fi
           fi
 
   # ─────── 2) Docker 镜像 build(只在 main 触发) ───────

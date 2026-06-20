@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
@@ -192,6 +193,11 @@ class PlanExecutor:
             except Exception as e:  # noqa: BLE001
                 last_err = f"{type(e).__name__}: {e}"
                 logger.warning("step_failed step=%s attempt=%d err=%s", step.id, attempts, last_err)
+                # RT-8 续:重试时退避(指数 + 抖动),避免上游 provider 雪崩
+                if attempts <= step.max_retries:
+                    backoff = min(1.0, 0.1 * (2 ** (attempts - 1)))
+                    jitter = random.uniform(0, 0.05)  # noqa: S311 — 测试用,非密码学
+                    await asyncio.sleep(backoff + jitter)
         return StepResult(
             step_id=step.id,
             status=StepStatus.FAILED,
