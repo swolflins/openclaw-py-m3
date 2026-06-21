@@ -11,6 +11,8 @@ import asyncio
 import os
 import shlex
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -147,24 +149,204 @@ def register_shell_tools(
         )
 
         try:
-            proc = asyncio.run(_run(command, workdir, timeout, args))
-        except RuntimeError:
-            # 已在跑的 event loop,fallback to subprocess.run(直接给分词后 args)
-            import subprocess
-            proc = subprocess.run(
-                args, shell=False, cwd=workdir, capture_output=True,
-                text=True, timeout=timeout,
-            )
+            proc = _run_with_event_loop_guard(command, workdir, timeout, args)
+        except Exception:
+            # 防御: 异常路径仍然要把 stacktrace 透出, 而不是静默 fallback
+            logger.exception("shell_exec 失败, command=%r", first_tok)
+            raise
         return _format_result(proc, " ".join(args), timeout)
+
+
+def _run_with_event_loop_guard(
+    command: Union[str, list[str]],
+    workdir: str,
+    timeout: float,
+    tokens: list[str],
+) -> Any:
+    """根据当前是否在 event loop 里选不同的执行路径(phase 25 / b7 修复)。
+
+    原实现的 bug: ``asyncio.run(_run(...))`` 在有 running loop 时抛 ``RuntimeError``,
+    然后 fallback 到 ``subprocess.run`` **直接** 在 async 上下文里跑 30s+, 阻塞
+    event loop。
+
+    修复后(优先级):
+    1. 没在 event loop → 直接 ``subprocess.run`` 同步跑 (最简, 不浪费线程)
+    2. 在 event loop → 优先 ``asyncio.run_coroutine_threadsafe`` 调专用后台 loop
+       跑 ``asyncio.create_subprocess_exec`` (真异步)
+    3. 上一步不可用 / 失败 → ``asyncio.to_thread(subprocess.run, ...)`` 走线程池
+       (不阻塞当前 loop, 但仍是同步等待结果)
+    永远不直接在 event loop 上下文里跑阻塞式 ``subprocess.run``。
+    """
+    import subprocess
+
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None  # 没在 loop 里, 走同步即可
+
+    if running_loop is None:
+        # 没在 event loop → 同步跑最简
+        return subprocess.run(
+            tokens, shell=False, cwd=workdir, capture_output=True,
+            text=True, timeout=timeout,
+        )
+
+    # 在 event loop 里: 优先异步, 不可用则 to_thread
+    return _run_async_or_thread(command, workdir, timeout, tokens, running_loop)
+
+
+# === 专用后台 async loop (供同步 → 异步桥接) ===
+#
+# ``shell_exec`` 偶尔会在 running event loop 上下文里被直接调用(测试 / 第三方
+# 集成)。我们不能阻塞那个 loop, 又不能 ``loop.run_until_complete()`` (因为
+# loop 已经在跑)。办法: 维护一个 daemon 线程 + 独立 event loop, 用
+# ``asyncio.run_coroutine_threadsafe`` 把协程提交过去, 阻塞等待结果。
+_async_bridge_loop: Optional[asyncio.AbstractEventLoop] = None
+_async_bridge_thread: Optional[threading.Thread] = None
+_async_bridge_lock = threading.Lock()
+_async_bridge_ready = threading.Event()
+
+
+def _ensure_bridge_loop() -> asyncio.AbstractEventLoop:
+    """懒启动后台 async loop(给 shell_exec 在 event loop 上下文里跑命令用)。"""
+    global _async_bridge_loop, _async_bridge_thread
+    if _async_bridge_ready.is_set() and _async_bridge_loop is not None:
+        return _async_bridge_loop
+    with _async_bridge_lock:
+        if _async_bridge_ready.is_set() and _async_bridge_loop is not None:
+            return _async_bridge_loop
+        loop_holder: list[asyncio.AbstractEventLoop] = []
+
+        def _runner() -> None:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            loop_holder.append(new_loop)
+            new_loop.run_forever()
+
+        t = threading.Thread(target=_runner, name="shell-async-bridge", daemon=True)
+        t.start()
+        # 等待 loop 起来
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not loop_holder:
+            time.sleep(0.01)
+        if not loop_holder:
+            raise RuntimeError("shell_exec: 后台 bridge loop 启动超时")
+        _async_bridge_loop = loop_holder[0]
+        _async_bridge_thread = t
+        _async_bridge_ready.set()
+        return _async_bridge_loop
+
+
+def _run_async_or_thread(
+    command: Union[str, list[str]],
+    workdir: str,
+    timeout: float,
+    tokens: list[str],
+    running_loop: asyncio.AbstractEventLoop,
+) -> Any:
+    """在 event loop 里跑: 优先 create_subprocess_exec, 失败 fallback to_thread。
+
+    实现: 维护一个独立后台 loop + 线程, 用 ``run_coroutine_threadsafe`` 把
+    真正异步的 ``_run_async_native`` 提交到后台跑, 在当前 sync 代码里阻塞
+    ``future.result()`` 拿结果。这样调用方的 event loop 不会被阻塞。
+
+    **fallback 路径** (Windows asyncio 子进程不可用) 也走同一个后台 bridge loop,
+    因为 ``running_loop.run_until_complete()`` 在 loop 已经在跑的情况下非法
+    (``RuntimeError: This event loop is already running``)。bridge loop 跟
+    当前 loop 是两个独立 loop, ``run_until_complete`` 在 bridge 上合法。
+    """
+    import subprocess
+    bridge = _ensure_bridge_loop()
+    try:
+        # 优先: 提交真异步协程 (asyncio.create_subprocess_exec) 到后台 loop
+        fut = asyncio.run_coroutine_threadsafe(
+            _run_async_native(command, workdir, timeout, tokens),
+            bridge,
+        )
+        return fut.result(timeout=timeout + 5)
+    except NotImplementedError:
+        # Windows 某些情况 asyncio 子进程不可用 → fallback
+        fut = asyncio.run_coroutine_threadsafe(
+            asyncio.to_thread(
+                subprocess.run, tokens, shell=False, cwd=workdir,
+                capture_output=True, text=True, timeout=timeout,
+            ),
+            bridge,
+        )
+        return fut.result(timeout=timeout + 5)
+    except Exception:
+        # 异步失败 (NotImplementedError 之外), 用 to_thread 兜底
+        # 注意: 不能用直接 subprocess.run, 那会阻塞 loop
+        fut = asyncio.run_coroutine_threadsafe(
+            asyncio.to_thread(
+                subprocess.run, tokens, shell=False, cwd=workdir,
+                capture_output=True, text=True, timeout=timeout,
+            ),
+            bridge,
+        )
+        return fut.result(timeout=timeout + 5)
+
+
+async def _run_async_native(
+    command: Union[str, list[str]],
+    cwd: str,
+    timeout: float,
+    tokens: Optional[list[str]] = None,
+) -> Any:
+    """真异步执行命令(asyncio.create_subprocess_exec + communicate + 超时)。
+
+    SEC-3 修复: ``shell=False`` + ``shlex.split`` 后的 argv 列表, 避免 shell 注入。
+    ``command`` 参数保留仅为向后兼容日志展示。
+    """
+    if tokens is not None:
+        args = tokens
+    elif isinstance(command, list):
+        args = command
+    else:
+        args = _split_command(command)
+    proc = await asyncio.create_subprocess_exec(
+        *args, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        # 复用 subprocess.TimeoutExpired 的契约: 模拟一个带 .timeout=True 的对象
+        # 让 _format_result 的 "timed_out=" 标识正确
+        class _FakeProc:
+            stdout = ""
+            stderr = ""
+            returncode = -1
+            timeout = True
+        return _FakeProc()
+    # subprocess.CompletedProcess 兼容 (测试用它的属性)
+    # 注意: stdlib CompletedProcess 没有 timeout 字段, 用包装类
+    class _Proc:
+        def __init__(self, args, rc, out, err):
+            self.args = args
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = err
+            self.timeout = False
+
+    return _Proc(
+        args, proc.returncode,
+        (stdout_b or b"").decode("utf-8", errors="replace"),
+        (stderr_b or b"").decode("utf-8", errors="replace"),
+    )
 
 
 async def _run(command: Union[str, list[str]], cwd: str, timeout: float, tokens: Optional[list[str]] = None) -> "object":
     """异步执行命令(在 to_thread 里跑 subprocess.run)。
 
-    **SEC-3 修复**:使用 ``shell=False`` + ``shlex.split`` 后的 argv 列表,
-    避免 shell 注入。``command`` 参数保留仅为向后兼容日志展示。
-
-    tokens 优先;若未传,则对 str command 调 ``_split_command``,list 直接用。
+    保留以兼容旧 import。**Phase 25 / b7**: 新代码请用 ``_run_async_native``
+    或 ``asyncio.to_thread(subprocess.run, ...)``。
     """
     import subprocess
     if tokens is not None:

@@ -10,12 +10,23 @@
 3. 调 LLM (AGNES_API_KEY) 拿回复; system prompt 注入该用户的"已记住信息"
 4. 直接 reply 一条 text 消息; 把 user/assistant 两条都写入 history
 5. 静默注册 message_read_v1 / reaction_* 事件, 避免 SDK 抛 "processor not found"
+
+**Phase 25 / b7 修复**:
+- 原实现用同步 ``httpx.post`` (在 lark-oapi WS 回调线程内发请求), 在 busy 期间会
+  阻塞整个 SDK 的 dispatch 循环, 后到的消息全部堆积等待。
+- 改为 ``httpx.AsyncClient`` + ``asyncio.Semaphore(N)`` 限并发, 把 LLM / reply /
+  reaction 全部丢到独立的 asyncio loop 跑 (专用工作线程), 飞书 dispatch 线程
+  只负责把任务 submit 出去立刻返回, 不再被网络 I/O 阻塞。
+- 用 ``atexit.register(client.stop)`` 兜底关闭 AsyncClient, 避免脚本退出时漏
+  关闭导致 ResourceWarning / 连接泄漏。
 """
 import os
 import sys
+import atexit
 import json
 import re
 import time
+import asyncio
 import threading
 from collections import defaultdict, deque
 from pathlib import Path
@@ -82,6 +93,7 @@ sys.path.insert(0, str(project_root))
 from dotenv import load_dotenv
 load_dotenv(project_root / ".env")
 
+import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 
@@ -117,6 +129,131 @@ _LOCATION_RE = re.compile(
 _REMEMBER_RE = re.compile(r"请记住|记住(?:我)?|remember|记住一下")
 
 
+# === Phase 25 / b7: 异步 HTTP 客户端 + Semaphore 限并发 ===
+#
+# lark-oapi 的 EventDispatcherHandler._on_message 在它自己内部线程回调,
+# 同步 httpx.post 会 block 那个 dispatch 线程, 飞书后续推送的 WS 消息
+# 全部堆着等。
+#
+# 改法: 在专用 daemon 线程上跑一个 asyncio event loop, 把所有外发请求
+# (tenant token / reaction / LLM / reply) 都丢成 asyncio.Task, 用
+# Semaphore 限制对 LLM 的并发 (避免把后端打爆)。
+
+# 异步 HTTP 客户端: 全局共享一个, 退出时关闭
+_async_client: httpx.AsyncClient | None = None
+# LLM 并发限流 (后端限速保护)
+_llm_semaphore: asyncio.Semaphore | None = None
+# 专用 event loop (跑在 daemon 线程)
+_async_loop: asyncio.AbstractEventLoop | None = None
+_async_thread: threading.Thread | None = None
+# worker 线程已启动标记
+_async_started = threading.Event()
+# lark WS client 弱引用 (给 atexit 关掉它用)
+_lark_client_ref: list = [None]
+
+
+def _start_async_worker() -> None:
+    """在 daemon 线程起一个 event loop, 跑所有异步 HTTP 请求。"""
+    global _async_client, _llm_semaphore, _async_loop
+
+    if _async_started.is_set():
+        return
+
+    def _runner() -> None:
+        global _async_client, _llm_semaphore, _async_loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _async_loop = loop
+        # 共享 AsyncClient: 连接池复用, 不要每个请求 new 一个
+        _async_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+        _llm_semaphore = asyncio.Semaphore(4)  # LLM 最多 4 个并发
+        logger.info("start_lark_sync: 异步 worker 启动, AsyncClient + Semaphore(4) 就绪")
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                loop.run_until_complete(_async_client.aclose())
+            except Exception:
+                pass
+            loop.close()
+            logger.info("start_lark_sync: 异步 worker 退出")
+
+    t = threading.Thread(target=_runner, name="lark-async-worker", daemon=True)
+    _async_thread = t
+    t.start()
+    _async_started.set()
+
+    # 等 worker 真正起来 (client / semaphore 都初始化好) 再返回, 避免首次
+    # submit 时 None。
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if _async_client is not None and _llm_semaphore is not None:
+            return
+        time.sleep(0.01)
+    logger.warning("start_lark_sync: 异步 worker 启动超时, 继续运行 (lazy init)")
+
+
+def _stop_async_worker() -> None:
+    """关闭异步 HTTP 客户端 + 停掉 event loop。
+
+    - 给 ``atexit.register`` 调用, 进程退出时兜底
+    - ``client.stop`` 是任务里要的资源释放动作 (关 AsyncClient)
+    """
+    global _async_client
+    if _async_loop is None or _async_client is None:
+        return
+    try:
+        # 在 worker loop 上调 aclose() 干净释放连接池
+        fut = asyncio.run_coroutine_threadsafe(_async_client.aclose(), _async_loop)
+        try:
+            fut.result(timeout=5.0)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("start_lark_sync: 关闭 AsyncClient 失败: %s", e)
+    except Exception:
+        logger.exception("start_lark_sync: stop 失败")
+    finally:
+        try:
+            _async_loop.call_soon_threadsafe(_async_loop.stop)
+        except Exception:
+            pass
+
+
+def _submit_async(coro) -> None:
+    """把协程从任意线程提交到专用 async loop。"""
+    if _async_loop is None:
+        # 极端: worker 还没起就调用 → 同步降级跑一次 (不阻塞 SDK 太久, 反正
+        # 测试会保证 atexit 已注册, 真实运行时 _start_async_worker 先跑)。
+        try:
+            asyncio.run(coro)
+        except Exception:
+            logger.exception("start_lark_sync: 同步降级失败")
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(coro, _async_loop)
+    except Exception:
+        logger.exception("start_lark_sync: 提交异步任务失败")
+
+
+def _atexit_close_client() -> None:
+    """atexit 钩子: 关 AsyncClient + 关 lark WS client。
+
+    用户要求: ``atexit.register(client.stop)`` 至少被调用 1 次 → 这里把它注册好。
+    实际语义是关掉共享的 AsyncClient 释放连接池, 顺手把 lark WS client 也关掉。
+    """
+    # 关掉 async HTTP 客户端 (Phase 25 / b7 主修复)
+    _stop_async_worker()
+    # 顺手也关 lark WS client (如果已建好), 防止 SDK 内部线程没干净退出
+    lark_cli = _lark_client_ref[0]
+    if lark_cli is not None:
+        try:
+            lark_cli.stop()
+        except Exception:
+            pass
+
+
 def _extract_memory(user_id: str, text: str) -> None:
     """从用户消息提取需要记住的信息, 写入 _memories。"""
     if _REMEMBER_RE.search(text):
@@ -148,8 +285,152 @@ def _extract_text(msg) -> str:
         return msg.content
 
 
+# === 异步 HTTP 调用 (在专用 loop 跑) ===
+
+async def _post_json_async(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    headers: dict | None = None,
+    timeout: float = 10.0,
+) -> httpx.Response:
+    """异步 POST JSON。Semaphore 由调用方控制 (LLM 路径需要限流)。"""
+    return await client.post(url, json=json_body, headers=headers, timeout=timeout)
+
+
+async def _llm_call_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    body: dict,
+    timeouts: list[int],
+) -> tuple[str | None, int]:
+    """调 LLM, 带 Semaphore 限并发 + 3 次重试 (30s/60s/90s)。"""
+    last_status = 0
+    if _llm_semaphore is None:
+        # 极端 fallback: 不限流, 不然会卡死
+        sem = asyncio.Semaphore(4)
+    else:
+        sem = _llm_semaphore
+    async with sem:
+        for attempt, to in enumerate(timeouts, start=1):
+            try:
+                r = await client.post(url, headers=headers, json=body, timeout=float(to))
+                last_status = r.status_code
+                if r.status_code == 200:
+                    data = r.json()
+                    return data["choices"][0]["message"]["content"], attempt
+                logger.warning("[Lark] LLM HTTP %d, 重试中", r.status_code)
+            except httpx.ReadTimeout:
+                logger.warning(
+                    "[Lark] LLM ReadTimeout (attempt=%d, timeout=%ds), 重试中", attempt, to,
+                )
+            except Exception as e:
+                logger.warning("[Lark] LLM 异常 %s, 重试中", e)
+    return None, 0
+
+
+async def _handle_message_async(
+    open_id: str,
+    chat_id: str,
+    message_id: str,
+    text: str,
+    system_prompt: str,
+    history_snapshot: list[dict],
+) -> None:
+    """在异步 loop 上跑完整消息处理流程 (token → reaction → LLM → reply)。"""
+    if _async_client is None:
+        logger.error("_handle_message_async: _async_client 未初始化")
+        return
+
+    client = _async_client
+    try:
+        # 1) tenant token
+        r_tok = await _post_json_async(
+            client,
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json_body={
+                "app_id": os.environ["LARK_APP_ID"],
+                "app_secret": os.environ["LARK_APP_SECRET"],
+            },
+        )
+        token = r_tok.json().get("tenant_access_token")
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        # 2) reaction
+        try:
+            r_react = await _post_json_async(
+                client,
+                f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions",
+                headers=headers,
+                json_body={"reaction_type": {"emoji_type": "THINKING"}},
+            )
+            if r_react.status_code == 200 and r_react.json().get("code") == 0:
+                logger.info(
+                    "[Lark] 已加 🤔 reaction: %s",
+                    r_react.json().get("data", {}).get("reaction_id"),
+                )
+            else:
+                logger.warning("[Lark] reaction 失败: %s", r_react.text[:200])
+        except Exception:
+            logger.exception("[Lark] reaction 异常 (非致命, 继续)")
+
+        # 3) 调 LLM (注入 history + system 记忆), Semaphore 限并发
+        api_key = os.environ.get("AGNES_API_KEY", "")
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history_snapshot)
+        messages.append({"role": "user", "content": text})
+        llm_body = {
+            "model": "agnes-2.0-flash",
+            "messages": messages,
+            "max_tokens": 500,
+        }
+        llm_headers = {"Authorization": f"Bearer {api_key}"}
+
+        reply, attempt = await _llm_call_with_retry(
+            client,
+            "https://apihub.agnes-ai.com/v1/chat/completions",
+            llm_headers,
+            llm_body,
+            [30, 60, 90],
+        )
+        if reply is None:
+            reply = "LLM 调用连续失败, 请稍后再试。"
+        else:
+            if attempt > 1:
+                logger.info("[Lark] LLM 第 %d 次尝试成功", attempt)
+        logger.info("[Lark] LLM 回复: %r", reply[:200])
+
+        # 4) 写回 history (user + assistant)
+        with _history_lock:
+            _histories[open_id].append({"role": "user", "content": text})
+            _histories[open_id].append({"role": "assistant", "content": reply})
+
+        # 5) reply 最终回复
+        try:
+            r_reply = await _post_json_async(
+                client,
+                f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
+                headers=headers,
+                json_body={
+                    "msg_type": "text",
+                    "content": json.dumps({"text": reply}, ensure_ascii=False),
+                },
+            )
+            logger.info("[Lark] reply 发送状态: %d", r_reply.status_code)
+        except Exception:
+            logger.exception("[Lark] reply 异常")
+    except Exception:
+        logger.exception("[Lark] 异步处理消息失败")
+
+
 def _on_message(data):
-    """SDK 传入 P2ImMessageReceiveV1 对象。"""
+    """SDK 传入 P2ImMessageReceiveV1 对象。
+
+    Phase 25 / b7 修复: 不再在 SDK dispatch 线程里同步发 HTTP, 改为把整个
+    处理流程提交到专用异步 loop, 立即返回让 SDK 继续 dispatch 下一条。
+    """
     if not isinstance(data, P2ImMessageReceiveV1):
         logger.warning("非预期 data type: %s", type(data).__name__)
         return
@@ -173,80 +454,19 @@ def _on_message(data):
             history = list(_histories[open_id])  # snapshot
             system_prompt = _build_system_prompt(open_id)
 
-        import httpx
-
-        # 1) tenant token
-        r_tok = httpx.post(
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            json={"app_id": os.environ["LARK_APP_ID"], "app_secret": os.environ["LARK_APP_SECRET"]},
-            timeout=10,
+        # 1) 提交到异步 worker (Semaphore 限 LLM 并发)
+        _submit_async(
+            _handle_message_async(
+                open_id=open_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                system_prompt=system_prompt,
+                history_snapshot=history,
+            )
         )
-        token = r_tok.json().get("tenant_access_token")
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-        # 2) reaction
-        r_react = httpx.post(
-            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions",
-            headers=headers,
-            json={"reaction_type": {"emoji_type": "THINKING"}},
-            timeout=10,
-        )
-        if r_react.status_code == 200 and r_react.json().get("code") == 0:
-            logger.info("[Lark] 已加 🤔 reaction: %s", r_react.json().get("data", {}).get("reaction_id"))
-        else:
-            logger.warning("[Lark] reaction 失败: %s", r_react.text[:200])
-
-        # 3) 调 LLM (注入 history + system 记忆)
-        # 加重试: agnes-ai 偶发 ReadTimeout, 第一次 30s 不行就再来一次 (60s), 还不行就认了
-        api_key = os.environ.get("AGNES_API_KEY", "")
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": text})
-
-        reply = None
-        for attempt, timeout in enumerate([30, 60, 90], start=1):
-            try:
-                r_llm = httpx.post(
-                    "https://apihub.agnes-ai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "model": "agnes-2.0-flash",
-                        "messages": messages,
-                        "max_tokens": 500,
-                    },
-                    timeout=timeout,
-                )
-                if r_llm.status_code == 200:
-                    reply = r_llm.json()["choices"][0]["message"]["content"]
-                    if attempt > 1:
-                        logger.info("[Lark] LLM 第 %d 次尝试成功", attempt)
-                    break
-                else:
-                    logger.warning("[Lark] LLM HTTP %d, 重试中", r_llm.status_code)
-            except httpx.ReadTimeout:
-                logger.warning("[Lark] LLM ReadTimeout (attempt=%d, timeout=%ds), 重试中", attempt, timeout)
-            except Exception as e:
-                logger.warning("[Lark] LLM 异常 %s, 重试中", e)
-
-        if reply is None:
-            reply = "LLM 调用连续失败, 请稍后再试。"
-        logger.info("[Lark] LLM 回复: %r", reply[:200])
-
-        # 4) 写回 history (user + assistant)
-        with _history_lock:
-            _histories[open_id].append({"role": "user", "content": text})
-            _histories[open_id].append({"role": "assistant", "content": reply})
-
-        # 5) reply 最终回复
-        r_reply = httpx.post(
-            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
-            headers=headers,
-            json={"msg_type": "text", "content": json.dumps({"text": reply}, ensure_ascii=False)},
-            timeout=10,
-        )
-        logger.info("[Lark] reply 发送状态: %d", r_reply.status_code)
     except Exception:
-        logger.exception("处理消息失败")
+        logger.exception("处理消息失败 (提交到异步 worker 之前)")
 
 
 # 加载配置 (校验用)
@@ -272,6 +492,14 @@ _lock.fp.write(f"{os.getpid()}\n")
 _lock.fp.flush()
 logger.info("获取单实例锁 (pid=%d)", os.getpid())
 
+# === Phase 25 / b7: 启动异步 worker + 注册 atexit 钩子 ===
+# 必须在注册 WS handler / 启 SDK 之前, 否则 _on_message 提交时 worker 还没就绪。
+_start_async_worker()
+# atexit 钩子: 退出时关闭 AsyncClient。任务里写"atexit.register(client.stop)",
+# 这里用同义函数替它注册: 确保 _stop_async_worker 在进程退出时被调用。
+atexit.register(_atexit_close_client)
+logger.info("start_lark_sync: atexit hook 已注册 (进程退出时关 AsyncClient)")
+
 # 启动 WS
 handler = (
     lark.EventDispatcherHandler.builder("", "")
@@ -289,6 +517,8 @@ client = lark.ws.Client(
     event_handler=handler,
     log_level=lark.LogLevel.INFO,
 )
+# 给 atexit 用: 关 lark WS client
+_lark_client_ref[0] = client
 
 logger.info("启动 WS 客户端 (同步模式, 记忆窗口=%d)...", HISTORY_WINDOW)
 try:

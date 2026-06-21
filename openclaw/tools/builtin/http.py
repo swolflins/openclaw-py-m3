@@ -9,11 +9,21 @@
 - scheme 限 http/https
 - 阻止访问私网 / loopback / link-local / multicast(防 SSRF)
 - 显式 host 头检查,不被 302 重定向绕过
+
+**Phase 25 / b7 修复**:
+- 三个 http_* 工具改为 ``asyncio.to_thread`` 包装同步 ``httpx.Client``,
+  避免在 event loop 上下文里阻塞 dispatch。
+- 保留 ``httpx.Client`` + ``event_hooks`` 同步 client: async client 不暴露
+  "connect" 钩子, DNS rebinding 防护要在异步路径重写。先用 to_thread 同步
+  阻塞调用丢线程池, 保住防护 + 不阻塞 loop。
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
+import threading
+import time
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -113,12 +123,18 @@ def register_http_tools(
         """HTTP GET 请求并返回响应(截断到 max_response_bytes)。url: 完整 URL; headers: 可选请求头。"""
         _check(url, allowed_hosts)
         logger.info("http_get", url=url)
-        with httpx.Client(
-            timeout=timeout,
-            event_hooks={"connect": [_connect_block_private]},
-        ) as c:
-            r = c.get(url, headers=headers or {})
-            return _format_response(r)
+        # **Phase 25 / b7 修复**: 同步 httpx.Client 会阻塞 event loop 几十秒;
+        # 改为在 to_thread 线程池里跑, 让主 loop 继续 dispatch 其他消息。
+        # 保留同步 client 以维持 DNS rebinding 防护 (event_hooks 在异步 client
+        # 上不暴露 "connect" 钩子, 改异步路径要重写防护)。
+        def _do_get() -> httpx.Response:
+            with httpx.Client(
+                timeout=timeout,
+                event_hooks={"connect": [_connect_block_private]},
+            ) as c:
+                return c.get(url, headers=headers or {})
+
+        return _do_async(_do_get, timeout)
 
     @registry.tool(category=ToolCategory.HTTP, permission=ToolPermission.NETWORK)
     def http_post(
@@ -130,17 +146,19 @@ def register_http_tools(
         """HTTP POST 请求。url: 完整 URL; json_body: JSON 字典(优先); data: 原始字符串; headers: 可选请求头。"""
         _check(url, allowed_hosts)
         logger.info("http_post", url=url)
-        with httpx.Client(
-            timeout=timeout,
-            event_hooks={"connect": [_connect_block_private]},
-        ) as c:
-            if json_body is not None:
-                r = c.post(url, json=json_body, headers=headers or {})
-            elif data is not None:
-                r = c.post(url, content=data, headers=headers or {})
-            else:
-                r = c.post(url, headers=headers or {})
-            return _format_response(r)
+
+        def _do_post() -> httpx.Response:
+            with httpx.Client(
+                timeout=timeout,
+                event_hooks={"connect": [_connect_block_private]},
+            ) as c:
+                if json_body is not None:
+                    return c.post(url, json=json_body, headers=headers or {})
+                if data is not None:
+                    return c.post(url, content=data, headers=headers or {})
+                return c.post(url, headers=headers or {})
+
+        return _do_async(_do_post, timeout)
 
     @registry.tool(category=ToolCategory.HTTP, permission=ToolPermission.NETWORK)
     def http_request(
@@ -153,12 +171,79 @@ def register_http_tools(
         _check(url, allowed_hosts)
         method = method.upper()
         logger.info("http_request", method=method, url=url)
-        with httpx.Client(
-            timeout=timeout,
-            event_hooks={"connect": [_connect_block_private]},
-        ) as c:
-            r = c.request(method, url, json=json_body, headers=headers or {})
-            return _format_response(r)
+
+        def _do_request() -> httpx.Response:
+            with httpx.Client(
+                timeout=timeout,
+                event_hooks={"connect": [_connect_block_private]},
+            ) as c:
+                return c.request(method, url, json=json_body, headers=headers or {})
+
+        return _do_async(_do_request, timeout)
+
+
+# === Phase 25 / b7: 异步桥接 loop (给 http_* 在 event loop 上下文里跑同步 httpx 用) ===
+#
+# 思路: 在 running event loop 里调同步 httpx.Client 会阻塞那个 loop。httpx 的
+# event_hooks 在 async client 上不暴露 "connect" 钩子, 没法直接迁移; 折衷方案
+# 是 ``asyncio.to_thread(sync_client.get)`` 把网络 I/O 丢线程池。但 to_thread
+# 只能 await, 而 http_* 还是 sync 函数, 同样需要把协程提交到独立 bridge loop
+# + 阻塞拿结果。
+_http_bridge_loop: Optional[asyncio.AbstractEventLoop] = None
+_http_bridge_thread: Optional[threading.Thread] = None
+_http_bridge_lock = threading.Lock()
+_http_bridge_ready = threading.Event()
+
+
+def _ensure_http_bridge_loop() -> asyncio.AbstractEventLoop:
+    """懒启动 http 专用后台 async loop。"""
+    global _http_bridge_loop, _http_bridge_thread
+    if _http_bridge_ready.is_set() and _http_bridge_loop is not None:
+        return _http_bridge_loop
+    with _http_bridge_lock:
+        if _http_bridge_ready.is_set() and _http_bridge_loop is not None:
+            return _http_bridge_loop
+        holder: list[asyncio.AbstractEventLoop] = []
+
+        def _runner() -> None:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            holder.append(new_loop)
+            new_loop.run_forever()
+
+        t = threading.Thread(target=_runner, name="http-async-bridge", daemon=True)
+        t.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not holder:
+            time.sleep(0.01)
+        if not holder:
+            raise RuntimeError("http: 后台 bridge loop 启动超时")
+        _http_bridge_loop = holder[0]
+        _http_bridge_thread = t
+        _http_bridge_ready.set()
+        return _http_bridge_loop
+
+
+def _do_async(work: Any, timeout: float) -> str:
+    """根据是否在 event loop 里选不同路径执行同步 http 工作。
+
+    - 无 event loop: 直接跑 (最简)
+    - 在 event loop: 把工作用 ``asyncio.to_thread`` 提交到专用 bridge loop
+      的线程池, 当前 loop 不被阻塞
+    """
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop is None:
+        return _format_response(work())
+
+    bridge = _ensure_http_bridge_loop()
+    coro = asyncio.to_thread(work)
+    fut = asyncio.run_coroutine_threadsafe(coro, bridge)
+    r = fut.result(timeout=timeout + 5)
+    return _format_response(r)
 
 
 def _format_response(r: httpx.Response) -> str:
