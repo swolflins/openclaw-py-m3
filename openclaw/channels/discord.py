@@ -6,8 +6,10 @@
 
 出站:Discord Bot API(httpx),只支持普通文本消息。
 
-依赖:无核心依赖;gateway 模式需要 discord.py。
+依赖:无核心依赖;gateway 模式需要 discord.py;
+     **Webhook 验签(Ed25519)需要 pynacl** — 缺失时在生产模式启动会被拒绝。
 环境变量: DISCORD_BOT_TOKEN (BOT 入站), DISCORD_PUBLIC_KEY (Webhook 验签)
+         OPENCLAW_ENV=production 触发启动期 pynacl 缺失检查
 """
 from __future__ import annotations
 
@@ -24,6 +26,27 @@ from openclaw.core.logging import get_logger
 logger = get_logger(__name__)
 
 API = "https://discord.com/api/v10"
+
+# Phase 25 / A2: 启动期强制 pynacl 在 production 可用
+_PROD_ENV_VARS = ("OPENCLAW_ENV", "OPENCLAW_GATEWAY_ENV")
+_PROD_VALUES = {"production", "prod"}
+
+
+def _is_production_mode() -> bool:
+    """Phase 25: 检测是否处于生产模式(任一 env var ∈ {production, prod})。"""
+    for var in _PROD_ENV_VARS:
+        if os.environ.get(var, "").strip().lower() in _PROD_VALUES:
+            return True
+    return False
+
+
+def _has_pynacl() -> bool:
+    """Phase 25: 探测 pynacl 是否真的可用(不抛异常)。"""
+    try:
+        from nacl.signing import VerifyKey  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 class DiscordChannel(BaseChannel):
@@ -43,6 +66,14 @@ class DiscordChannel(BaseChannel):
         self.use_gateway = use_gateway
         self._client: Optional[httpx.AsyncClient] = None
         self._gw_task: Optional[asyncio.Task] = None
+        # Phase 25 / A2: 生产模式下,如果配了 public_key 但 pynacl 不可用,
+        # 直接抛 RuntimeError 拒绝启动(fail-closed)。
+        # 非生产模式只 log warning,让本地开发不强制装 pynacl。
+        if self.public_key and not _has_pynacl() and _is_production_mode():
+            raise RuntimeError(
+                "[phase25/A2] production 模式 + 配置了 DISCORD_PUBLIC_KEY 但 pynacl 缺失。"
+                "Webhook 验签无法进行,启动被拒绝。修复: pip install pynacl"
+            )
 
     @property
     def available(self) -> bool:
@@ -61,6 +92,12 @@ class DiscordChannel(BaseChannel):
     async def start(self) -> None:
         if not self.available:
             raise RuntimeError("Discord 凭据未配置 (DISCORD_BOT_TOKEN)")
+        # Phase 25 / A2: 再次校验 production + public_key + pynacl(双保险)。
+        if self.public_key and not _has_pynacl() and _is_production_mode():
+            raise RuntimeError(
+                "[phase25/A2] start() 检测到 production 模式 + public_key 已配置但 pynacl 缺失。"
+                "启动被拒绝(fail-closed)。修复: pip install pynacl"
+            )
         # 先 GET /users/@me 确认 token 有效
         client = await self._get_client()
         r = await client.get("/users/@me")
@@ -110,14 +147,25 @@ class DiscordChannel(BaseChannel):
     # ---------- Webhook 入站 ----------
 
     def verify_signature(self, body: bytes, signature: str, timestamp: str) -> bool:
-        """Discord 出站 webhook 必须验签(Ed25519),简化为可选(pip install nacl)。"""
+        """Discord 出站 webhook 必须验签(Ed25519),简化为可选(pip install nacl)。
+
+        **Phase 25 / A2 安全修复(fail-closed)**:
+        - 之前 pynacl 缺失时 ``return True`` → 生产部署忘装 pynacl 会**放行所有 webhook**(签名伪造)。
+        - 现在: pynacl 不可用时 ``return False`` + log error,让外层路由返 400。
+        - 启动期已在 ``__init__`` / ``start`` 强制 production + public_key + pynacl 三者必须一致,
+          所以"运行到这里还缺 pynacl"一定是误配置 → 直接拒。
+        """
         if not self.public_key:
             return True  # 没配公钥就不验(本地开发)
         try:
             from nacl.signing import VerifyKey
         except Exception:
-            logger.warning("pynacl not installed, skip verify")
-            return True
+            # **关键**: 缺失时 return False,不再 fail-open。
+            logger.error(
+                "pynacl not installed but DISCORD_PUBLIC_KEY is set — "
+                "**rejecting** webhook (fail-closed). Install pynacl to verify signatures."
+            )
+            return False
         try:
             vk = VerifyKey(bytes.fromhex(self.public_key))
             vk.verify(timestamp.encode() + body, bytes.fromhex(signature))
