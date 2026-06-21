@@ -9,6 +9,7 @@
 #   make cli        # 启 CLI 交互
 #   make docker     # 构镜像
 #   make compose    # docker compose up
+#   make ci-check   # **CI 等效检查**(ruff + pytest)— push 前必跑
 #   make smoke      # 跑所有 phase 的烟测
 #   make clean      # 清缓存
 
@@ -35,6 +36,11 @@ test:  ## 跑全部测试
 
 test-fast:  ## 跑测试(不显示 traceback)
 	$(PYTEST) tests/ -q --tb=no
+
+ci-check: lint  ## **CI 等效检查**(ruff + pytest + 70% coverage gate)— push 前必跑
+	$(PYTEST) tests/ -q --tb=line --cov=openclaw --cov-fail-under=70
+	@echo ""
+	@echo "==> CI 等效检查完成(ruff + pytest 70% 门禁);可放心 push"
 
 lint:  ## ruff check
 	$(RUFF) check openclaw/ tests/ examples/
