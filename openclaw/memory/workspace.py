@@ -4,10 +4,12 @@
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import sqlite3
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,8 +48,29 @@ class WorkspaceIndex:
             c.executescript(_SCHEMA)
             c.commit()
 
-    def _conn(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+    @contextlib.contextmanager
+    def _conn(self):
+        """打开一个新 SQLite 连接,with 退出时**自动 close**。
+
+        **Phase 25 / b10 修复**:
+        每次 ``sqlite3.connect`` 都开新 fd,如果不显式 ``close()`` 会泄漏。
+        现在的统一做法:用 ``contextlib.closing`` 包装,确保 ``with`` 块
+        退出时一定 close;同时挂 ``weakref.finalize`` 兜底,即使
+        调用方绕过 context manager,实例 GC 时也会自动 close。
+        """
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # 兜底:实例被 GC 时,如果连接还活着,就关掉它
+        try:
+            weakref.finalize(self, _close_silently, conn)
+        except TypeError:  # pragma: no cover - self 不支持 weakref
+            pass
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover
+                pass
 
     def upsert(self, file_path: Path, *, summary: str = "") -> FileEntry:
         p = file_path.resolve()
@@ -81,3 +104,14 @@ class WorkspaceIndex:
                 (k,),
             ).fetchall()
         return [FileEntry(*r) for r in rows]
+
+
+def _close_silently(conn: sqlite3.Connection) -> None:
+    """``weakref.finalize`` 回调:实例 GC 时安全 close 残留连接。
+
+    用模块级函数(非闭包)以保证 weakref 可序列化/可哈希。
+    """
+    try:
+        conn.close()
+    except Exception:  # pragma: no cover
+        pass

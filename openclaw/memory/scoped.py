@@ -9,13 +9,21 @@ scope 格式: '{kind}:{id}'   例如 'session:abc' / 'user:u1' / 'channel:lark:c
 
 **RT-1 修复**:所有 SQLite / ChromaDB / 文件 IO 都通过
 ``asyncio.to_thread`` 包装,绝不阻塞事件循环。
+
+**Phase 25 / b10 修复**:长期记忆的写入和读出都过 sanitize,防双向 prompt-injection:
+- 写入时:防投毒(恶意 assistant reply 落库后污染后续召回)
+- 读出时:防召回内容里嵌入 "ignore previous instructions" 等指令覆写
+- 净化 = ``strip_prompt_injection(strip_external_content(text))``:
+  - ``strip_external_content`` 负责 HTML / 特殊 token / 零宽字符
+  - ``strip_prompt_injection`` 负责主动删除已知注入模式
 """
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
+from openclaw.core.sanitize import strip_external_content, strip_prompt_injection
 from openclaw.llm.base import ChatMessage
 from openclaw.memory.long_term import LongTermStore, MemoryItem
 from openclaw.memory.short_term import ShortTermStore
@@ -64,12 +72,19 @@ class ScopedMemory:
             self.short.append, scope, user, assistant, metadata=metadata
         )
         # 长期记忆:把 assistant 回复(知识性内容)写入
+        # Phase 25 / b10:写入前 sanitize,防投毒落库
+        # 既过 ``strip_external_content``(HTML/特殊 token/零宽),也过
+        # ``strip_prompt_injection``(主动删 "ignore previous instructions" 等)
         if self.long is not None and assistant and len(assistant) >= 20:
             try:
+                safe_text = strip_prompt_injection(strip_external_content(assistant))
+                if not safe_text or not safe_text.strip():
+                    # 净化后空 → 跳过(避免写入空串)
+                    return
                 # RT-1 + NEW-2: 同步 ChromaDB IO 也走 to_thread
                 await asyncio.to_thread(
                     self.long.add,
-                    assistant,
+                    safe_text,
                     scope=scope,
                     metadata={"source": "assistant"},
                 )
@@ -87,9 +102,26 @@ class ScopedMemory:
             return []
         try:
             # RT-1: ChromaDB query 同步 → 异步
-            return await asyncio.to_thread(
+            items = await asyncio.to_thread(
                 self.long.query, query, scope=scope, top_k=top_k
             )
+            # Phase 25 / b10:读出时 sanitize,防召回内容里嵌 prompt injection
+            sanitized: list[MemoryItem] = []
+            for it in items:
+                # 既过 ``strip_external_content``(HTML/特殊 token/零宽),也过
+                # ``strip_prompt_injection``(主动删 "ignore previous instructions" 等)
+                safe = strip_prompt_injection(strip_external_content(it.text or ""))
+                if safe != it.text:
+                    # 文本被净化过 → 记录日志(便于审计)
+                    logger.info(
+                        "long_term_recall_sanitized",
+                        id=it.id,
+                        orig_len=len(it.text or ""),
+                        new_len=len(safe),
+                    )
+                # 用 replace 产生新对象,保留原 id / metadata / distance
+                sanitized.append(replace(it, text=safe))
+            return sanitized
         except Exception:
             logger.exception("long_term_query_failed")
             return []
@@ -113,6 +145,7 @@ class ScopedMemory:
         """拼装: [soul-augmented-system, recalled-context, history..., user]。
 
         **RT-1 修复**:此方法已改 async,所有底层 IO 异步化。
+        **Phase 25 / b10 修复**:recalled 内容已在 ``recall()`` 中过 sanitize。
         """
         system = self.render_system_prompt(base=system_prompt)
 

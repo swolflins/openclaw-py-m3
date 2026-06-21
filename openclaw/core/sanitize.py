@@ -295,6 +295,38 @@ def has_prompt_injection(
     return bool(detect_prompt_injection(text, normalize_first=normalize_first))
 
 
+def strip_prompt_injection(text: str, *, replacement: str = " ") -> str:
+    """把检测到的 prompt-injection 模式主动替换成占位符。
+
+    与 ``detect_prompt_injection`` 不同:这是**破坏性**操作,
+    命中后把匹配片段替换成 ``replacement``(默认空格),用于长期记忆
+    落库/召回时的双向净化,防投毒后被拼回 LLM 上下文。
+
+    Args:
+        text: 待清洗文本
+        replacement: 替换字符串(默认空格,保持 token 间距)
+
+    Returns:
+        清洗后的文本(空串返回原值)
+    """
+    if not text:
+        return text
+    out = text
+    # role_override 必须在 normalize 之前跑:特殊 token 会被净化器吃掉
+    for pattern in _PATTERNS_ROLE:
+        out = pattern.sub(replacement, out)
+    # 其他 3 类在 normalize 之后的文本上跑(防同形绕过)
+    norm = strip_external_content(out)
+    for patterns in (
+        _PATTERNS_OVERRIDE,
+        _PATTERNS_TOOL_ABUSE,
+        _PATTERNS_EXFIL,
+    ):
+        for pattern in patterns:
+            norm = pattern.sub(replacement, norm)
+    return norm
+
+
 # =========================================================================
 # ReDoS safe-regex(P0-2)
 # =========================================================================
@@ -336,6 +368,7 @@ __all__ = [
     "strip_external_content",
     "detect_prompt_injection",
     "has_prompt_injection",
+    "strip_prompt_injection",
     "InjectionHit",
     "is_safe_regex",
 ]
