@@ -22,10 +22,28 @@ try:
 except ImportError:
     playwright_available = False
 
+
+def _chromium_binary_available() -> bool:
+    """检查 playwright chromium binary 是否就绪(CI 没跑 `playwright install` 时跳过)。"""
+    if not playwright_available:
+        return False
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            # 找 chromium binary;若不存在会抛 FileNotFoundError / Error
+            exe = p.chromium.executable_path
+            import os
+            return bool(exe) and os.path.exists(exe)
+    except Exception:
+        return False
+
+
+chromium_available = _chromium_binary_available()
+
 # 跳过的真实浏览器 e2e(没 chromium)
 needs_browser = pytest.mark.skipif(
-    not playwright_available,
-    reason="playwright not installed",
+    not chromium_available,
+    reason="playwright chromium binary not installed (run `playwright install chromium`)",
 )
 
 
