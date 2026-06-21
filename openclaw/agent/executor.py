@@ -127,10 +127,19 @@ class PlanExecutor:
             # 同层并发,但限流到 max_parallel。
             # 用 cancel 机制让 critical step 失败时,同层其它 step 能被中断。
             sem = asyncio.Semaphore(self.max_parallel)
+            # Phase 25 / b8:``local_failed`` 跨多协程并发追加,原代码无锁
+            # → GIL 之下 list.append 是原子的,但语义上仍是 data race;
+            # asyncio 调度下也可能在 yield 点之间互相覆盖。
+            # 修法:用 ``asyncio.Lock`` 保护追加,确保 critical step 失败时
+            # 同层其它 step 能可靠地看到 ``local_failed`` 非空并被短路 SKIPPED。
             local_failed: list[str] = []
+            local_failed_lock = asyncio.Lock()
 
             async def _run_one(s: PlanStep) -> StepResult:
-                if local_failed and s.critical:
+                # 读取前先在锁内复制,避免长时间持锁。
+                async with local_failed_lock:
+                    had_failure = bool(local_failed)
+                if had_failure and s.critical:
                     return StepResult(step_id=s.id, status=StepStatus.SKIPPED)
                 if self.on_step_start:
                     try:
@@ -139,7 +148,8 @@ class PlanExecutor:
                         logger.exception("on_step_start hook failed")
                 sr = await self._exec_step(s, step_results, sem)
                 if sr.status == StepStatus.FAILED and s.critical:
-                    local_failed.append(s.id)
+                    async with local_failed_lock:
+                        local_failed.append(s.id)
                 return sr
 
             outs = await asyncio.gather(*[_run_one(s) for s in pending], return_exceptions=False)

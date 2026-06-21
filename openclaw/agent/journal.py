@@ -323,7 +323,18 @@ class AgentJournal:
     # ───── 反思 ─────
 
     async def reflect(self, entry: JournalEntry) -> str:
-        """调 reflector → 拿反思 → append 到 entry 文件(只一份,去重)。"""
+        """调 reflector → 拿反思 → append 到 entry 文件(只一份,去重)。
+
+        **Phase 25 / b8 修复**:
+        修复前 ``for existing_refl in entry.reflections[:-1]: if ...
+        in tail: continue`` 的循环体只有 ``continue``,是死代码;
+        真正去重落在循环外的 ``if reflection not in tail``,导致
+        "已存在反思"的判断残缺、也没把空行 / 重复行归一。
+
+        修法:用 ``seen`` set 跟踪已出现过的反思文本,跳过空行 / 完全
+        重复行;再把整篇 head 走一遍 ``_collapse_blank_lines`` 归一
+        连续空行(``\\n\\n\\n\\n\\n`` → ``\\n\\n``),保证输出稳定。
+        """
         reflection = self.reflector.reflect(entry)
         entry.reflections.append(reflection)
 
@@ -335,14 +346,44 @@ class AgentJournal:
         tail = ""
         if "---" in existing:
             tail = "---" + existing.split("---", 1)[1]
-        # 去重:同一反思已存在则不再追加
-        for existing_refl in entry.reflections[:-1]:
-            if existing_refl in tail:
+        # 去重:用 seen set 跟踪已经出现过的反思文本(按 strip 后判等),
+        # 1) 空字符串 / 仅空白 reflection 跳过;
+        # 2) 已经被写入过(tail 里有)的 reflection 跳过。
+        seen: set[str] = set()
+        for existing_refl in entry.reflections:
+            stripped = existing_refl.strip()
+            if not stripped:
                 continue
-        if reflection not in tail:
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+        # 真正写入:仅当反思非空、且之前还没出现过时才 append 到 tail。
+        if reflection.strip() and reflection not in tail:
             tail = tail + "\n" + reflection + "\n"
-        path.write_text(head + tail, encoding="utf-8")
+        # 归一连续空行(head + tail),5 个空行 → 1 个空行。
+        final_text = self._collapse_blank_lines(head + tail)
+        path.write_text(final_text, encoding="utf-8")
         return reflection
+
+    @staticmethod
+    def _collapse_blank_lines(text: str) -> str:
+        """把连续空行(>1)压缩成单个空行。
+
+        实现:用 ``seen_blank`` 状态机 — 上一行是空行时,本行空就跳过。
+        """
+        out_lines: list[str] = []
+        seen_blank = False
+        for line in text.splitlines():
+            is_blank = not line.strip()
+            if is_blank and seen_blank:
+                continue
+            out_lines.append(line)
+            seen_blank = is_blank
+        # splitlines 会丢尾部换行,这里保留原末尾换行特征
+        result = "\n".join(out_lines)
+        if text.endswith("\n") and not result.endswith("\n"):
+            result += "\n"
+        return result
 
     async def add_reflection(self, entry: JournalEntry, text: str) -> None:
         entry.reflections.append(text)
