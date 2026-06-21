@@ -325,45 +325,80 @@ class AgentJournal:
     async def reflect(self, entry: JournalEntry) -> str:
         """调 reflector → 拿反思 → append 到 entry 文件(只一份,去重)。
 
-        **Phase 25 / b8 修复**:
-        修复前 ``for existing_refl in entry.reflections[:-1]: if ...
-        in tail: continue`` 的循环体只有 ``continue``,是死代码;
-        真正去重落在循环外的 ``if reflection not in tail``,导致
-        "已存在反思"的判断残缺、也没把空行 / 重复行归一。
+        **Phase 25 / b8 修复(本提交真正落实)**:
+        上一版 ``for existing_refl in entry.reflections: seen.add(...)``
+        循环只填充 ``seen`` 却从不读取,是死代码;真正写入只靠循环外的
+        ``if reflection not in tail``,且 ``tail`` 直接拼了已落盘的
+        ``---`` + ``<!-- 反思将追加在下方 -->`` 占位段,导致每调一次
+        reflect 就多写一份占位段(N+1 份)。
 
-        修法:用 ``seen`` set 跟踪已出现过的反思文本,跳过空行 / 完全
-        重复行;再把整篇 head 走一遍 ``_collapse_blank_lines`` 归一
-        连续空行(``\\n\\n\\n\\n\\n`` → ``\\n\\n``),保证输出稳定。
+        修法:
+        1. 用 ``_extract_reflections`` 从已落盘文件里抽出**真正的反思块**
+           (跳过 ``---`` 分隔行与占位段),不再连带占位段一起拼回去;
+        2. ``seen`` set 真正参与去重 —— 对 "已落盘反思 + 本次新反思"
+           统一按 strip 后判等,保序去重(首次出现优先);
+        3. ``head`` 只生成一次(含一份占位段),去重后的反思按顺序追加在
+           占位段之后,占位段不再被重复写入。
         """
         reflection = self.reflector.reflect(entry)
         entry.reflections.append(reflection)
 
         path = Path(self._entry_filename(entry))
-        # 重新生成 head(reflector 可能改了 tags)+ append 已有反思(去重)
-        head = self._entry_to_md(entry)
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        # 找到第一个 "---" 之后的内容(尾部),去掉"<!-- 反思将追加在下方 -->"占位
-        tail = ""
-        if "---" in existing:
-            tail = "---" + existing.split("---", 1)[1]
-        # 去重:用 seen set 跟踪已经出现过的反思文本(按 strip 后判等),
-        # 1) 空字符串 / 仅空白 reflection 跳过;
-        # 2) 已经被写入过(tail 里有)的 reflection 跳过。
+        existing_reflections = self._extract_reflections(existing)
+
+        # seen 真正参与去重:已落盘反思优先,再本次新反思,按 strip 判等保序。
         seen: set[str] = set()
-        for existing_refl in entry.reflections:
-            stripped = existing_refl.strip()
+        ordered: list[str] = []
+        for refl in (*existing_reflections, reflection):
+            stripped = refl.strip()
             if not stripped:
                 continue
             if stripped in seen:
                 continue
             seen.add(stripped)
-        # 真正写入:仅当反思非空、且之前还没出现过时才 append 到 tail。
-        if reflection.strip() and reflection not in tail:
-            tail = tail + "\n" + reflection + "\n"
+            ordered.append(stripped)
+
+        # head 含一份占位段;反思按顺序追加在占位段下方(不再重复拼 --- / 占位段)。
+        head = self._entry_to_md(entry)
+        tail = "".join("\n" + refl + "\n" for refl in ordered)
         # 归一连续空行(head + tail),5 个空行 → 1 个空行。
         final_text = self._collapse_blank_lines(head + tail)
         path.write_text(final_text, encoding="utf-8")
         return reflection
+
+    @staticmethod
+    def _extract_reflections(text: str) -> list[str]:
+        """从已落盘的 entry 文本里抽取反思块(跳过占位段 / 分隔行)。
+
+        反思块以行首 ``# `` 开头(``TemplateReflector`` 返回 ``# 反思 ...``、
+        ``LLMReflector`` 返回 ``# LLM 反思``);反思内部的 ``##`` 子标题、
+        ``---`` 分隔行、``<!-- 反思将追加在下方 -->`` 占位段都不会被当作
+        新块的开头(它们要么出现在首个 ``# `` 之前被丢弃,要么并入当前块)。
+
+        这一步是去重能否真正生效的前提 —— 旧实现直接把
+        ``"---" + existing.split("---", 1)[1]`` 当 tail 拼回去,把占位段
+        也一起带进了输出,导致占位段被反复写入。
+        """
+        marker = "<!-- 反思将追加在下方 -->"
+        idx = text.find(marker)
+        if idx == -1:
+            return []
+        body = text[idx + len(marker):]
+        blocks: list[str] = []
+        current: list[str] = []
+        for line in body.splitlines():
+            if line.startswith("# "):
+                # 一个新的反思块开始:先把上一个块收尾
+                if current:
+                    blocks.append("\n".join(current).strip())
+                current = [line]
+            elif current:
+                # 当前块内的行(含 ## 子标题、空行等)并入当前块
+                current.append(line)
+        if current:
+            blocks.append("\n".join(current).strip())
+        return [b for b in blocks if b]
 
     @staticmethod
     def _collapse_blank_lines(text: str) -> str:

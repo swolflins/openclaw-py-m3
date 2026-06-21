@@ -60,7 +60,13 @@ class ShortTermStore:
         self.dir = Path(dir_path)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.dir / "memory.sqlite"
-        self._lock = threading.Lock()
+        # Phase 25 review follow-up:用 RLock(可重入)而非 Lock。
+        # ``append()`` 写完会在同一线程内调 ``_backup()`` → ``recent()``,
+        # 而 ``recent()`` 会再次 ``with self._lock``。``threading.Lock``
+        # 不可重入,一旦 ``_backup`` 在持锁上下文里被调用就会死锁/阻塞;
+        # RLock 允许同线程重复获取,消除该死锁风险(且对当前"锁外调
+        # _backup"的写法零行为变化)。
+        self._lock = threading.RLock()
         self._init_db()
 
     def _init_db(self) -> None:
@@ -91,7 +97,12 @@ class ShortTermStore:
         """追加一轮对话(同时记到指定 scope)。"""
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         ts = time.time()
-        # MEM-1:显式 close + try/finally
+        # MEM-1:显式 close + try/finally。
+        # Phase 25 review follow-up:把 ``_backup`` 移入锁内 —— 写 + 备份做成
+        # 原子快照(避免"刚 commit 另一线程又 append"导致备份串了的竞态)。
+        # ``_backup`` → ``recent()`` 会再次 ``with self._lock``;因为这里用的是
+        # RLock(可重入),同线程二次获取不会死锁。若改回不可重入的 Lock,
+        # 这里会立刻死锁 —— RLock 是必需的。
         with self._lock:
             conn = self._conn()
             try:
@@ -105,7 +116,7 @@ class ShortTermStore:
                 conn.commit()
             finally:
                 conn.close()
-        self._backup(scope)
+            self._backup(scope)
 
     def recent(self, scope: str, k: int = 20) -> list[ChatMessage]:
         with self._lock:

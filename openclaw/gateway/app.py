@@ -167,14 +167,61 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("gateway_stopped")
 
 
+def _validate_cors_origin(origin: str) -> str:
+    """校验单个 CORS origin 格式,返回清洗后的 origin;非法则抛 ValueError。
+
+    **Phase 25 review follow-up**:
+    之前 ``OPENCLAW_CORS_ORIGINS`` 直接 ``split(",")`` 拼进 ``allow_origins``,
+    无任何校验。配合 ``allow_credentials=True`` 使用时,一个误配(尤其是
+    ``*`` 通配)就会变成"任意源 + 携带凭据"的经典 CSRF 跨源组合拳。
+
+    规则:
+    - 拒绝 ``*`` 通配 —— 它与 ``allow_credentials=True`` 互斥(浏览器会拒,
+      但 starlette 仍可能回显具体 origin),启动期硬拒最安全;
+    - 必须是合法 URL,scheme 限 ``http`` / ``https``;
+    - 必须有 host(netloc);端口 / 路径可选。
+    """
+    o = origin.strip()
+    if not o:
+        raise ValueError("CORS origin 为空")
+    if o == "*":
+        raise ValueError(
+            "CORS origin 不允许使用 '*' 通配:它与 allow_credentials=True 互斥"
+            "(任意源 + 携带凭据 = CSRF)。请改为显式列出可信 origin。"
+        )
+    from urllib.parse import urlparse
+
+    parsed = urlparse(o)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"CORS origin 格式非法 {o!r}:scheme 必须是 http/https"
+            f"(例:'https://app.example.com')"
+        )
+    if not parsed.netloc or not parsed.hostname:
+        raise ValueError(
+            f"CORS origin 格式非法 {o!r}:缺少 host(例:'https://app.example.com')"
+        )
+    # 拒绝 host 里的通配(如 https://*.example.com):配合 allow_credentials=True
+    # 同样是跨源 CSRF 风险。要做"模式匹配"请走 allow_origin_regex(dev 默认
+    # 已对 localhost/127.0.0.1 开了端口通配),不要把通配塞进 allow_origins。
+    if "*" in parsed.netloc:
+        raise ValueError(
+            f"CORS origin 格式非法 {o!r}:host 不允许通配 '*'。"
+            "需要模式匹配请用 allow_origin_regex(而非 allow_origins)。"
+        )
+    return o
+
+
 def _resolve_cors_origins() -> list[str]:
     """解析允许的 CORS origin 列表。
 
-    行为(Phase 25/b9):
+    行为(Phase 25/b9 + review follow-up):
     - **生产模式** ``is_production_mode()`` → 空列表(禁 CORS,任何跨域直接拒)。
     - dev / test 模式:
       - 默认允许 ``http://localhost:*`` + ``http://127.0.0.1:*``(具体端口由浏览器匹配)。
       - 额外 origin 通过 ``OPENCLAW_CORS_ORIGINS`` 注入(逗号分隔)。
+    - **review follow-up**:env 注入的 origin 走 ``_validate_cors_origin`` 强校验
+      (拒绝 ``*`` 与格式非法值),misconfig 启动期 fail-fast 而不是静默放行。
     """
     from openclaw.gateway.auth import is_production_mode
     if is_production_mode():
@@ -191,8 +238,10 @@ def _resolve_cors_origins() -> list[str]:
     if extra:
         for o in extra.split(","):
             o = o.strip()
-            if o:
-                origins.append(o)
+            if not o:
+                continue
+            # 强校验:非法 origin(含 '*')启动期 fail-fast,避免 CSRF 误配。
+            origins.append(_validate_cors_origin(o))
     return origins
 
 

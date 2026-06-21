@@ -127,6 +127,8 @@ def register_docker_tools(
         """在临时 Python 容器里跑一段代码并返回 stdout。code: Python 源码; image: 镜像,默认 python:3.11-slim。"""
         _ensure_docker()
         img = _resolve_image(image)
+        # Phase 25 review follow-up:docker.from_env() 返回的 DockerClient 持有
+        # 连接池 / APIClient,用完必须 close(),否则每次调用都泄漏一个连接。
         client = docker.from_env()
         try:
             container = client.containers.run(
@@ -151,12 +153,15 @@ def register_docker_tools(
             logger.info("docker_pull_start", image=img)
             client.images.pull(img)
             return docker_run_python(code=code, image=img)
+        finally:
+            client.close()
 
     @registry.tool(category=ToolCategory.SANDBOX, permission=ToolPermission.ADMIN)
     def docker_exec(command: str, image: str = "") -> str:
         """在临时容器里跑一条 shell 命令并返回结果。command: 完整命令; image: 镜像。"""
         _ensure_docker()
         img = _resolve_image(image)
+        # Phase 25 review follow-up:同上,client 用完 close()。
         client = docker.from_env()
         try:
             container = client.containers.run(
@@ -179,6 +184,8 @@ def register_docker_tools(
         except ImageNotFound:
             client.images.pull(img)
             return docker_exec(command=command, image=img)
+        finally:
+            client.close()
 
     @registry.tool(category=ToolCategory.SANDBOX, permission=ToolPermission.ADMIN)
     def docker_pull(image: str) -> str:
@@ -186,23 +193,30 @@ def register_docker_tools(
         _ensure_docker()
         # TOOL 优化:即使是显式 pull 也要走白名单
         img = _resolve_image(image)
+        # Phase 25 review follow-up:client 用完 close()。
         client = docker.from_env()
-        client.images.pull(img)
-        return f"pulled {img}"
+        try:
+            client.images.pull(img)
+            return f"pulled {img}"
+        finally:
+            client.close()
 
     @registry.tool(category=ToolCategory.SANDBOX, permission=ToolPermission.READ)
     def docker_list_images() -> str:
         """列出本地已有 docker 镜像。"""
         if not _HAS_DOCKER:
             return "[error] docker 未安装,运行 `pip install openclaw-py[all]` 获取 docker SDK"
+        # Phase 25 review follow-up:from_env() 本身可能抛(pywintypes.error on Windows runner without
+        # docker daemon,PermissionError on Linux 无 /var/run/docker.sock),单独 try 以便给出友好错误;
+        # 拿到 client 后用 try/finally 确保关闭,避免连接泄漏。
         try:
-            # from_env() 本身可能抛(pywintypes.error on Windows runner without
-            # docker daemon,PermissionError on Linux 无 /var/run/docker.sock),
-            # 必须放在 try 里,否则 test_docker_tools_optional 会 fail
             client = docker.from_env()
-            images = client.images.list()
         except Exception as e:
             return f"[error] 连接 docker daemon 失败: {e}"
+        try:
+            images = client.images.list()
+        finally:
+            client.close()
         if not images:
             return "(no images)"
         return "\n".join(
