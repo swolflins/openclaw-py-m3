@@ -343,8 +343,16 @@ class ToolRegistry:
                 errors=[f"arguments is not a dict: {type(arguments).__name__}"],
             )
         _validate_arguments(name, t.parameters, arguments)
-        # 2) 审批
-        if t.requires_approval and self._approver is not None:
+        # 2) 审批 — fail-closed(C1 修复)
+        #    旧逻辑:`_approver is None` 时直接放行所有 requires_approval 工具,
+        #    导致 shell_exec / docker_exec / write_file 等危险工具在未配置
+        #    approver 时完全不审批。改为 fail-closed:无 approver 即拒绝。
+        if t.requires_approval:
+            if self._approver is None:
+                raise PermissionError(
+                    f"tool {name} requires approval but no approver is configured "
+                    "(fail-closed: call set_approver() to enable execution)"
+                )
             ok = await self._approver(name, arguments)
             if not ok:
                 raise PermissionError(f"tool {name} rejected by approver")

@@ -61,7 +61,7 @@ def make_entry(tool_calls=None, iterations=1, content="hi", user="hello"):
 def test_template_reflector_simple_qa():
     from openclaw.agent.journal import TemplateReflector
     e = make_entry(tool_calls=[], iterations=1)
-    text = TemplateReflector().reflect(e)
+    text = asyncio.run(TemplateReflector().reflect(e))  # H4: reflect 改为 async
     assert "# 反思" in text
     assert "simple_qa" in e.tags
     assert "工具调用次数: **0**" in text
@@ -71,7 +71,7 @@ def test_template_reflector_simple_qa():
 def test_template_reflector_complex_marks_deep_reasoning():
     from openclaw.agent.journal import TemplateReflector
     e = make_entry(tool_calls=[{"name": "x"}] * 7, iterations=6)
-    TemplateReflector().reflect(e)
+    asyncio.run(TemplateReflector().reflect(e))  # H4: reflect 改为 async
     assert "complex_workflow" in e.tags
     assert "deep_reasoning" in e.tags
 
@@ -82,7 +82,7 @@ def test_template_reflector_with_error():
         tool_calls=[{"name": "shell_exec", "result": "[tool error] something failed"}],
         iterations=2,
     )
-    text = TemplateReflector().reflect(e)
+    text = asyncio.run(TemplateReflector().reflect(e))  # H4: reflect 改为 async
     assert "had_errors" in e.tags
     assert "工具出错 1 次" in text
     assert "⚠️ 部分工具调用失败" in text

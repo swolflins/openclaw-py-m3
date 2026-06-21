@@ -7,10 +7,13 @@
     WHATSAPP_TOKEN          long-lived access token from Meta Business
     WHATSAPP_PHONE_ID       phone number ID
     WHATSAPP_VERIFY_TOKEN   webhook 握手时校验
+    WHATSAPP_APP_SECRET     App Secret,用于校验 X-Hub-Signature-256(C2 修复)
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import os
 from typing import Any, Optional
 
@@ -35,11 +38,14 @@ class WhatsAppChannel(BaseChannel):
         agent_loop: AgentLoop,
         *,
         verify_token: Optional[str] = None,
+        app_secret: Optional[str] = None,
     ) -> None:
         super().__init__(agent_loop)
         self.token = token
         self.phone_id = phone_id
         self.verify_token = verify_token
+        # C2 修复:App Secret 用于校验 Meta 推送的 X-Hub-Signature-256
+        self.app_secret = app_secret
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -94,11 +100,56 @@ class WhatsAppChannel(BaseChannel):
     # ---------- Webhook ----------
 
     def verify_webhook(self, mode: str, token: str, challenge: str) -> Optional[str]:
-        if mode == "subscribe" and token == self.verify_token:
+        # C2 修复:用 hmac.compare_digest 防时序攻击
+        if mode == "subscribe" and self.verify_token and hmac.compare_digest(token, self.verify_token):
             return challenge
         return None
 
-    async def ingest_webhook(self, payload: dict[str, Any]) -> None:
+    def verify_signature(self, raw_body: bytes, signature_header: str | None) -> bool:
+        """C2 修复:校验 Meta 推送的 X-Hub-Signature-256。
+
+        签名格式:``sha256=<hex>``,其中 hex = HMAC-SHA256(app_secret, raw_body)。
+        - ``app_secret`` 未配置时返回 False(fail-closed,防止未验签部署)
+        - ``signature_header`` 缺失或不匹配时返回 False
+        """
+        if not self.app_secret:
+            logger.critical(
+                "whatsapp_webhook_no_app_secret:WHATSAPP_APP_SECRET 未配置,"
+                "webhook 验签被跳过 — 任何人可伪造消息。请设置 WHATSAPP_APP_SECRET。"
+            )
+            return False
+        if not signature_header:
+            return False
+        # Meta 格式:sha256=<hex>
+        if not signature_header.startswith("sha256="):
+            return False
+        expected = hmac.new(
+            self.app_secret.encode("utf-8"), raw_body, hashlib.sha256
+        ).hexdigest()
+        provided = signature_header[7:]  # 去掉 "sha256=" 前缀
+        return hmac.compare_digest(expected, provided)
+
+    async def ingest_webhook(
+        self,
+        payload: dict[str, Any],
+        *,
+        raw_body: bytes | None = None,
+        signature: str | None = None,
+    ) -> None:
+        # C2 修复:入口验签
+        #   - app_secret 已配置:必须提供 raw_body + signature 且校验通过
+        #   - app_secret 未配置:fail-closed,拒绝处理(防止伪造消息)
+        #   - raw_body=None(旧调用方式/测试):若 app_secret 也未配置,记 critical
+        #     警告后放行(向后兼容);若 app_secret 已配置则拒绝
+        if self.app_secret:
+            if raw_body is None or not self.verify_signature(raw_body, signature):
+                logger.warning("whatsapp_webhook_signature_invalid:拒绝未验签的 webhook")
+                return
+        else:
+            logger.critical(
+                "whatsapp_webhook_no_app_secret:WHATSAPP_APP_SECRET 未配置,"
+                "webhook 验签被跳过 — 任何人可伪造消息。请设置 WHATSAPP_APP_SECRET。"
+            )
         entries = payload.get("entry") or []
         for entry in entries:
             for change in entry.get("changes") or []:
@@ -139,4 +190,5 @@ def from_env(agent_loop: AgentLoop) -> Optional[WhatsAppChannel]:
         phone_id=phone,
         agent_loop=agent_loop,
         verify_token=os.environ.get("WHATSAPP_VERIFY_TOKEN"),
+        app_secret=os.environ.get("WHATSAPP_APP_SECRET"),  # C2 修复
     )

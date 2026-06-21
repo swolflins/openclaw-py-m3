@@ -58,3 +58,4 @@ Thumbs.db
 # 阶段 commit 用的临时烟测日志
 /tmp/
 /*.log
+.start_lark_sync.lock

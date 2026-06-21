@@ -232,6 +232,7 @@ def test_short_term_clear_path_traversal_blocked():
 
 def test_tools_set_approver_requires_confirm(monkeypatch):
     monkeypatch.setenv("OPENCLAW_GATEWAY_TOKEN", "")
+    monkeypatch.setenv("OPENCLAW_GATEWAY_ADMIN_TOKEN", "admin-secret")  # H2: admin token
     from fastapi.testclient import TestClient
     from openclaw.gateway.app import create_app
     from openclaw.gateway import deps as deps_mod
@@ -241,7 +242,9 @@ def test_tools_set_approver_requires_confirm(monkeypatch):
     deps_mod.set_deps(d)
     try:
         client = TestClient(create_app(deps=d))
-        r = client.post("/v1/tools/approver", json={"approved": True})
+        # H2: 需要 X-Admin-Token header
+        r = client.post("/v1/tools/approver", json={"approved": True},
+                        headers={"X-Admin-Token": "admin-secret"})
         assert r.status_code == 403
         assert "CONFIRM" in r.text
     finally:

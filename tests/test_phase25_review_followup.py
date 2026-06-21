@@ -30,6 +30,14 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parent.parent
 
 
+# C1 修复后,requires_approval 工具在无 approver 时 fail-closed。
+# 测试中需要一个 always-approve 的 approver。
+def _set_test_approver(reg: ToolRegistry) -> None:
+    async def _ok(name, args):
+        return True
+    reg.set_approver(_ok)
+
+
 # ────────────────────────────────────────────────────────────────
 # 1. AgentJournal.reflect — 占位段不再 N+1 重复 + seen 真去重
 # ────────────────────────────────────────────────────────────────
@@ -49,7 +57,7 @@ class _StaticReflector:
     def __init__(self, text: str) -> None:
         self.text = text
 
-    def reflect(self, entry) -> str:  # noqa: ANN001
+    async def reflect(self, entry) -> str:  # noqa: ANN001  # H4: async
         return self.text
 
 
@@ -113,7 +121,7 @@ def test_journal_reflect_keeps_distinct_reflections_in_order(tmp_path: Path):
     seq = iter(texts)
 
     class _SeqReflector:
-        def reflect(self, entry):  # noqa: ANN001
+        async def reflect(self, entry):  # noqa: ANN001  # H4: async
             return next(seq)
 
     j = AgentJournal(root=tmp_path / "j", reflector=_SeqReflector())
@@ -315,7 +323,11 @@ TOK_NEW = "newtoken-padded-32-chars-bb"
 
 
 def test_resolve_user_id_priority():
-    """``_resolve_user_id`` 优先级:user_id(稳定)> token_to_user 映射 > token[:16] fallback。"""
+    """``_resolve_user_id`` 优先级:user_id(稳定)> token_to_user 映射 > sha256(token)[:16] fallback。
+
+    L5 修复:fallback 从 token[:16] 改为 "h_"+sha256(token)[:16],不泄露原始 token。
+    """
+    import hashlib
     from openclaw.gateway.auth import AuthMiddleware
 
     R = AuthMiddleware._resolve_user_id
@@ -323,8 +335,9 @@ def test_resolve_user_id_priority():
     assert R("any-token", {"any-token": "bob"}, "alice") == "alice"
     # 2) 无 user_id 时走映射
     assert R("t1", {"t1": "alice"}, None) == "alice"
-    # 3) 都没有 → token[:16] fallback
-    assert R("token-A-padded-to-32", {}, None) == "token-A-padded-t"
+    # 3) 都没有 → sha256(token)[:16] fallback (L5 修复)
+    expected = "h_" + hashlib.sha256("token-A-padded-to-32".encode()).hexdigest()[:16]
+    assert R("token-A-padded-to-32", {}, None) == expected
     # 4) 无 token → anonymous
     assert R(None, {}, None) == "anonymous"
 
@@ -352,10 +365,12 @@ def test_token_rotation_keeps_user_id_with_gateway_user_id_env(monkeypatch):
 
 
 def test_token_rotation_without_user_id_env_changes_user_id(monkeypatch):
-    """没设 ``OPENCLAW_GATEWAY_USER_ID`` → token 轮换后 user_id 变化(回退到 token[:16],不稳定)。
+    """没设 ``OPENCLAW_GATEWAY_USER_ID`` → token 轮换后 user_id 变化(回退到 sha256(token)[:16],不稳定)。
 
     这是修复**保留**的向后兼容行为,但生产应避免(启动期会 warning)。
+    L5 修复:user_id 从 token[:16] 改为 "h_"+sha256(token)[:16],不泄露原始 token。
     """
+    import hashlib
     from openclaw.gateway.auth import install_auth
 
     monkeypatch.setenv("OPENCLAW_GATEWAY_TOKEN", f"{TOK_OLD},{TOK_NEW}")
@@ -373,8 +388,11 @@ def test_token_rotation_without_user_id_env_changes_user_id(monkeypatch):
 
     r_old = client.get("/v1/whoami", headers={"Authorization": f"Bearer {TOK_OLD}"})
     r_new = client.get("/v1/whoami", headers={"Authorization": f"Bearer {TOK_NEW}"})
-    assert r_old.json()["user_id"] == TOK_OLD[:16]
-    assert r_new.json()["user_id"] == TOK_NEW[:16]
+    # L5 修复:user_id = "h_" + sha256(token)[:16]
+    expected_old = "h_" + hashlib.sha256(TOK_OLD.encode()).hexdigest()[:16]
+    expected_new = "h_" + hashlib.sha256(TOK_NEW.encode()).hexdigest()[:16]
+    assert r_old.json()["user_id"] == expected_old
+    assert r_new.json()["user_id"] == expected_new
     assert r_old.json()["user_id"] != r_new.json()["user_id"]  # 轮换 → 蒸发(旧行为)
 
 
@@ -500,6 +518,7 @@ def _registry_with_docker_tools():
 
 def test_docker_pull_closes_client(_patch_docker_from_env):
     reg = _registry_with_docker_tools()
+    _set_test_approver(reg)  # C1: docker_pull requires approval
     out = asyncio.run(reg.call("docker_pull", {"image": "python:3.11-slim"}))
     assert "pulled" in out
     assert _patch_docker_from_env, "client 应被创建"
@@ -516,6 +535,7 @@ def test_docker_list_images_closes_client(_patch_docker_from_env):
 
 def test_docker_run_python_closes_client(_patch_docker_from_env):
     reg = _registry_with_docker_tools()
+    _set_test_approver(reg)  # C1: docker_run_python requires approval
     out = asyncio.run(reg.call("docker_run_python", {"code": "print(1)", "image": "python:3.11-slim"}))
     assert "[exit=0]" in out
     assert "hello-from-container" in out
@@ -524,6 +544,7 @@ def test_docker_run_python_closes_client(_patch_docker_from_env):
 
 def test_docker_exec_closes_client(_patch_docker_from_env):
     reg = _registry_with_docker_tools()
+    _set_test_approver(reg)  # C1: docker_exec requires approval
     out = asyncio.run(reg.call("docker_exec", {"command": "echo hi", "image": "python:3.11-slim"}))
     assert "[exit=0]" in out
     assert _patch_docker_from_env[-1].closed, "docker_exec 未 close client"

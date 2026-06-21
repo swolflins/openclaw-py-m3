@@ -86,10 +86,15 @@ class RateLimiter:
     # ---------------- 异步 ----------------
 
     async def aallow(self, key: str, cost: float = 1.0) -> bool:
-        return self.allow(key, cost)
+        # M14 修复:用 run_in_executor 避免阻塞事件循环
+        # 旧逻辑:直接调同步 allow(内部 threading.Lock + sqlite.commit),
+        # 高并发或慢磁盘时阻塞整个 event loop
+        import asyncio
+        return await asyncio.to_thread(self.allow, key, cost)
 
     async def aretry_after(self, key: str, cost: float = 1.0) -> float:
-        return self.retry_after(key, cost)
+        import asyncio
+        return await asyncio.to_thread(self.retry_after, key, cost)
 
     # ---------------- 内部 ----------------
 
@@ -100,9 +105,11 @@ class RateLimiter:
             # SEC-12:达到 max_keys 上限,先 LRU 淘汰最久未活动的 key
             if len(self._buckets) >= self.max_keys and key not in self._buckets:
                 self._evict_lru()
-            # 仍满 → 拒(返回当前 burst 的全新 bucket,但不写)
+            # H5 修复:仍满 → fail-closed(返回空桶,不允许通过)
+            # 旧逻辑返回 tokens=burst 的临时桶 → _consume 判定 tokens>=cost 放行 = fail-open
+            # 新逻辑返回 tokens=0 的桶 → _consume 判定 tokens<cost 拒绝 = fail-closed
             if len(self._buckets) >= self.max_keys and key not in self._buckets:
-                return _Bucket(tokens=self.burst, last_refill=now)
+                return _Bucket(tokens=0, last_refill=now)
             b = _Bucket(tokens=self.burst, last_refill=now)
             self._buckets[key] = b
         else:

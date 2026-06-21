@@ -55,8 +55,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if not any(path.startswith(p) for p in _LIMITED_PREFIXES):
             return await call_next(request)
-        # 用 session_id 或 remote addr 作为 key
-        sid = request.headers.get("X-Session-Id") or (request.client.host if request.client else "anon")
+        # 用 remote addr 作为限流 key(H3 修复:不再用客户端可控的 X-Session-Id)
+        # 旧逻辑:sid = request.headers.get("X-Session-Id") or request.client.host
+        # 攻击者每请求带不同 UUID 即可绕过限流。改为仅用 client.host。
+        sid = request.client.host if request.client else "anon"
         if not self._limiter.allow(sid):
             retry = self._limiter.retry_after(sid)
             return JSONResponse(
@@ -279,7 +281,7 @@ def create_app(
     - 启动时若 ``is_production_mode()`` → ``app.docs_url / redoc_url / openapi_url`` 全部置 None。
     """
     # NEW-1:生产模式无 token → 启动期直接拒绝
-    from openclaw.gateway.auth import require_token_in_production, is_production_mode
+    from openclaw.gateway.auth import require_token_in_production, is_production_mode, is_dev_mode
     require_token_in_production()
 
     # Phase 25:host=0.0.0.0 但 token 未配置 → 启动期 fail-fast
@@ -291,6 +293,15 @@ def create_app(
             "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
             "为防止未鉴权部署,启动被拒绝。请设置: "
             "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+        )
+    # H1 修复:无 token + 非 dev 模式 → fail-closed(不论 host)
+    # 防止 uvicorn --host 0.0.0.0 绕过上面的 host 检查
+    if not _token_raw and not is_dev_mode():
+        raise RuntimeError(
+            "[H1] OPENCLAW_GATEWAY_TOKEN 未设置且未显式开启 dev 模式。"
+            "为防止未鉴权部署,启动被拒绝。请执行以下任一操作:\n"
+            "  1. 设置 token:export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')\n"
+            "  2. 本地开发:export OPENCLAW_GATEWAY_DEV=1"
         )
 
     # Phase 25/b9:prod 模式关 docs(避免暴露内部 API 描述)

@@ -101,8 +101,13 @@ class SlackChannel(BaseChannel):
 
     def verify_signature(self, body: bytes, timestamp: str, signature: str) -> bool:
         """Slack signing secret:HMAC-SHA256(secret, 'v0:'+ts+body)。"""
+        # M8 修复:无 signing_secret 时 fail-closed(旧逻辑 return True = 放行)
         if not self.signing_secret:
-            return True
+            logger.critical(
+                "slack_signing_secret_not_configured:webhook 验签被跳过 — "
+                "任何人可伪造消息。请设置 SLACK_SIGNING_SECRET。"
+            )
+            return False
         if abs(time.time() - int(timestamp)) > 300:
             return False
         sig_base = f"v0:{timestamp}".encode() + body

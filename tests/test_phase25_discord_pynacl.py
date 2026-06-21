@@ -115,7 +115,9 @@ def test_pynacl_missing_valid_sig_rejects(monkeypatch):
     )
 
     # 给一个"看起来合法"的 sig + timestamp(64 hex chars)
-    result = ch.verify_signature(b'{"type":2}', "a" * 128, "1700000000")
+    # M8 修复:verify_signature 现在校验 timestamp 新鲜度(±300s),用当前时间
+    import time as _time
+    result = ch.verify_signature(b'{"type":2}', "a" * 128, str(int(_time.time())))
     assert result is False, (
         f"FAIL-OPEN 回归! pynacl 缺失时 verify_signature 返 {result!r} "
         f"(应返 False 触发 400)。"
@@ -178,7 +180,9 @@ def test_pynacl_available_valid_sig_accepts():
         public_key=pub_hex,
     )
     body = b'{"type":2,"data":{"name":"ping"}}'
-    ts = "1700000000"
+    # M8 修复:verify_signature 现在校验 timestamp 新鲜度(±300s),用当前时间
+    import time as _time
+    ts = str(int(_time.time()))
     sig = _sign(priv_hex, ts.encode() + body)
     assert ch.verify_signature(body, sig, ts) is True
 
@@ -195,11 +199,14 @@ def test_pynacl_available_invalid_sig_rejects():
     )
     body = b'{"type":2,"data":{"name":"evil"}}'
     # 用另一个 keypair 签(签名方 ≠ public_key 对应方)
+    # M8 修复:用当前时间戳(verify_signature 现在校验新鲜度)
+    import time as _time
+    ts = str(int(_time.time()))
     other_priv, _ = _gen_ed25519_keypair()
-    bad_sig = _sign(other_priv, b"1700000000" + body)
-    assert ch.verify_signature(body, bad_sig, "1700000000") is False
+    bad_sig = _sign(other_priv, ts.encode() + body)
+    assert ch.verify_signature(body, bad_sig, ts) is False
     # 长度异常的 hex
-    assert ch.verify_signature(body, "not_hex_!!", "1700000000") is False
+    assert ch.verify_signature(body, "not_hex_!!", ts) is False
 
 
 # ─────── 边界 / 回归测试 ───────

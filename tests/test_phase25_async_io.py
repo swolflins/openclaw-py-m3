@@ -34,6 +34,14 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+# C1 修复后,requires_approval 工具在无 approver 时 fail-closed。
+# 测试中需要一个 always-approve 的 approver。
+def _set_test_approver(reg: ToolRegistry) -> None:
+    async def _ok(name, args):
+        return True
+    reg.set_approver(_ok)
+
+
 # ────────────────────────────────────────────────────────────────
 # 1. shell_exec 不阻塞 event loop
 # ────────────────────────────────────────────────────────────────
@@ -54,6 +62,7 @@ def test_shell_exec_does_not_block_event_loop(tmp_path: Path):
 
     reg = ToolRegistry()
     register_builtin_tools(reg, shell_default_cwd=str(tmp_path), fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: shell_exec requires approval
 
     async def _scenario():
         t0 = time.time()
@@ -327,6 +336,7 @@ def test_shell_exec_still_works_sync(tmp_path: Path):
 
     reg = ToolRegistry()
     register_builtin_tools(reg, shell_default_cwd=str(tmp_path), fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     out = asyncio.run(
         reg.call("shell_exec", {"command": "echo regression_ok", "timeout": 5})
     )
@@ -341,6 +351,7 @@ def test_shell_exec_argv_list_still_works(tmp_path: Path):
 
     reg = ToolRegistry()
     register_builtin_tools(reg, shell_default_cwd=str(tmp_path), fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     out = asyncio.run(
         reg.call("shell_exec", {"command": ["echo", "argv_ok"], "timeout": 5})
     )

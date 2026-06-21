@@ -14,6 +14,14 @@ from openclaw.tools.registry import (
 )
 
 
+# C1 修复后,requires_approval 工具在无 approver 时 fail-closed。
+# 测试中需要一个 always-approve 的 approver。
+def _set_test_approver(reg: ToolRegistry) -> None:
+    async def _ok(name, args):
+        return True
+    reg.set_approver(_ok)
+
+
 # ---------------- registry ----------------
 
 def test_registry_categories_and_permissions():
@@ -64,6 +72,7 @@ def test_registry_specs_filtered():
 def test_shell_exec_runs_command(tmp_path: Path):
     reg = ToolRegistry()
     register_builtin_tools(reg, shell_default_cwd=str(tmp_path), fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     out = asyncio.run(reg.call("shell_exec", {"command": "echo hello", "timeout": 5}))
     assert "hello" in out
     assert "[exit=0]" in out
@@ -94,6 +103,7 @@ def test_shell_exec_rejects_metachar(tmp_path: Path):
 def test_fs_read_write_list(tmp_path: Path):
     reg = ToolRegistry()
     register_builtin_tools(reg, fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: write_file requires approval
     asyncio.run(reg.call("write_file", {"path": "a.txt", "content": "hi"}))
     text = asyncio.run(reg.call("read_file", {"path": "a.txt"}))
     assert "hi" in text
@@ -111,6 +121,7 @@ def test_fs_blocks_path_escape(tmp_path: Path):
 def test_fs_refuses_overwrite_without_flag(tmp_path: Path):
     reg = ToolRegistry()
     register_builtin_tools(reg, fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: write_file requires approval
     asyncio.run(reg.call("write_file", {"path": "a.txt", "content": "x"}))
     out = asyncio.run(reg.call("write_file", {"path": "a.txt", "content": "y"}))
     assert "[error]" in out
@@ -122,6 +133,7 @@ def test_fs_refuses_overwrite_without_flag(tmp_path: Path):
 def test_fs_search(tmp_path: Path):
     reg = ToolRegistry()
     register_builtin_tools(reg, fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: write_file requires approval
     asyncio.run(reg.call("write_file", {"path": "src/main.py", "content": "def foo(): pass\n"}))
     asyncio.run(reg.call("write_file", {"path": "src/util.py", "content": "x = 1\n"}))
     found = asyncio.run(reg.call("search_files", {"path": ".", "pattern": "**/*.py"}))
@@ -156,6 +168,7 @@ def test_datetime_tools():
 def test_cron_add_and_list_and_remove():
     reg = ToolRegistry()
     register_builtin_tools(reg, include=["cron_add", "cron_list", "cron_remove"], fs_root=".")
+    _set_test_approver(reg)  # C1: cron_add requires approval
     jid_line = asyncio.run(reg.call("cron_add", {"every_seconds": 60, "payload": "ping"}))
     assert "job_" in jid_line
     # 提取 job_id
@@ -169,6 +182,7 @@ def test_cron_add_and_list_and_remove():
 def test_cron_add_rejects_empty():
     reg = ToolRegistry()
     register_builtin_tools(reg, include=["cron_add"], fs_root=".")
+    _set_test_approver(reg)  # C1: cron_add requires approval
     out = asyncio.run(reg.call("cron_add", {}))
     assert "[error]" in out
 

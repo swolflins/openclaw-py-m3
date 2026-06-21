@@ -10,10 +10,10 @@ Phase 23:加 ``GET /v1/sessions/{sid}/messages/{msg_id}`` 反查 UI 消息原文
 from __future__ import annotations
 
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from openclaw.gateway.deps import get_deps
+from openclaw.gateway.deps import current_user_id, get_deps
 from openclaw.gateway.message_store import MessageStore
 from openclaw.gateway.util import to_jsonable
 
@@ -56,7 +56,11 @@ async def list_sessions() -> dict:
 
 
 @router.get("/{session_id}")
-async def get_session(session_id: str, k: int = Query(20, ge=1, le=200)) -> dict:
+async def get_session(session_id: str, request: Request, k: int = Query(20, ge=1, le=200)) -> dict:
+    # M7 修复:per-user 校验,防 IDOR
+    uid = current_user_id(request)
+    if uid != "anonymous" and not session_id.startswith(f"{uid}:"):
+        raise HTTPException(403, "session does not belong to current user")
     short = _short()
     if short is None:
         raise HTTPException(503, "agent_loop not attached")
@@ -91,8 +95,12 @@ async def get_message(session_id: str, msg_id: str) -> dict:
 
 
 @router.get("/{session_id}/messages")
-async def list_messages(session_id: str, k: int = Query(50, ge=1, le=500)) -> dict:
+async def list_messages(session_id: str, request: Request, k: int = Query(50, ge=1, le=500)) -> dict:
     """列一个 session 最近 k 条 UI 消息(按时间倒序,最新在前)。"""
+    # M7 修复:per-user 校验,防 IDOR
+    uid = current_user_id(request)
+    if uid != "anonymous" and not session_id.startswith(f"{uid}:"):
+        raise HTTPException(403, "session does not belong to current user")
     ms = _message_store()
     msgs = await ms.list_session(session_id, k=k)
     return {
@@ -103,11 +111,15 @@ async def list_messages(session_id: str, k: int = Query(50, ge=1, le=500)) -> di
 
 
 @router.delete("/{session_id}")
-async def clear_session(session_id: str) -> dict:
+async def clear_session(session_id: str, request: Request) -> dict:
     """清一个 session:既清 LLM memory,也清 UI 消息元数据。
 
     两个 sub-system 解耦:可能没 agent_loop(只清 UI),可能没 message_store(只清 memory)。
     """
+    # M7 修复:per-user 校验,防 IDOR
+    uid = current_user_id(request)
+    if uid != "anonymous" and not session_id.startswith(f"{uid}:"):
+        raise HTTPException(403, "session does not belong to current user")
     short = _short()
     memory_cleared = False
     if short is not None and hasattr(short, "clear"):

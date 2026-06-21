@@ -101,6 +101,9 @@ def register_http_tools(
     """
 
     # SEC-7:连接时再校验一次目标 IP(防 DNS rebinding)
+    # M2 修复:httpx event_hooks 只支持 "request"/"response" 两个 key,
+    # "connect" 会被静默忽略。改为 "request" hook — 在请求发出前解析 host
+    # 并校验 IP,防短 TTL DNS rebinding(首次返公网 IP,真正连接时返内网)。
     def _connect_block_private(request):
         # 拿到 httpx 已解析好的 host
         host = request.url.host
@@ -130,7 +133,7 @@ def register_http_tools(
         def _do_get() -> httpx.Response:
             with httpx.Client(
                 timeout=timeout,
-                event_hooks={"connect": [_connect_block_private]},
+                event_hooks={"request": [_connect_block_private]},
             ) as c:
                 return c.get(url, headers=headers or {})
 
@@ -150,7 +153,7 @@ def register_http_tools(
         def _do_post() -> httpx.Response:
             with httpx.Client(
                 timeout=timeout,
-                event_hooks={"connect": [_connect_block_private]},
+                event_hooks={"request": [_connect_block_private]},
             ) as c:
                 if json_body is not None:
                     return c.post(url, json=json_body, headers=headers or {})
@@ -175,7 +178,7 @@ def register_http_tools(
         def _do_request() -> httpx.Response:
             with httpx.Client(
                 timeout=timeout,
-                event_hooks={"connect": [_connect_block_private]},
+                event_hooks={"request": [_connect_block_private]},
             ) as c:
                 return c.request(method, url, json=json_body, headers=headers or {})
 

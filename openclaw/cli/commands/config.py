@@ -129,8 +129,9 @@ def _deep_get(data: Any, parts: list[Any]) -> Any:
 
 def _deep_set(data: dict[str, Any], parts: list[Any], value: Any) -> None:
     cur = data
-    for p in parts[:-1]:
-        nxt = parts[parts.index(p) + 1]
+    # L10 修复:用 enumerate 替代 parts.index(p),避免重复路径段取错索引
+    for i, p in enumerate(parts[:-1]):
+        nxt = parts[i + 1]
         if isinstance(p, int):
             cur = cur[p]  # type: ignore[index]
         else:

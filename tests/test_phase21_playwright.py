@@ -115,6 +115,10 @@ def test_browse_url_rejects_not_allowlisted():
     from openclaw.tools.registry import ToolRegistry
     reg = ToolRegistry()
     register_browser_tools(reg, allowed_domains=["example.com"])
+    # C1: browse_url (NETWORK permission) requires approval
+    async def _ok(name, args):
+        return True
+    reg.set_approver(_ok)
     out = asyncio.run(reg.call("browse_url", {"url": "https://evil.com/x"}))
     assert "[error]" in out
     assert "not in allow-list" in out
@@ -126,6 +130,10 @@ def test_browse_url_rejects_file_protocol():
     from openclaw.tools.registry import ToolRegistry
     reg = ToolRegistry()
     register_browser_tools(reg, allowed_domains=["example.com"])
+    # C1: browse_url (NETWORK permission) requires approval
+    async def _ok(name, args):
+        return True
+    reg.set_approver(_ok)
     out = asyncio.run(reg.call("browse_url", {"url": "file:///etc/passwd"}))
     assert "[error]" in out
 

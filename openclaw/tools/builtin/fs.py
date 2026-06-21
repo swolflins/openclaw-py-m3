@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 from openclaw.core.logging import get_logger
+from openclaw.core.sanitize import is_safe_regex
 from openclaw.tools.registry import ToolCategory, ToolPermission, ToolRegistry
 
 logger = get_logger(__name__)
@@ -92,9 +93,11 @@ def register_fs_tools(
         if not real.is_file():
             return f"[error] not a regular file: {p}"
         cap = max_bytes or max_read_bytes
-        text = real.read_text(encoding="utf-8", errors="replace")
+        # M5 修复:限量读取,避免大文件 OOM(旧逻辑先全读再截断)
+        with real.open("r", encoding="utf-8", errors="replace") as f:
+            text = f.read(cap + 1)
         if len(text) > cap:
-            text = text[:cap] + f"\n... [truncated, {len(text) - cap} chars omitted]"
+            text = text[:cap] + f"\n... [truncated, remaining omitted]"
         return text
 
     @registry.tool(category=ToolCategory.FS, permission=ToolPermission.WRITE)
@@ -168,6 +171,9 @@ def register_fs_tools(
                 if len(results) >= max_results:
                     break
         else:
+            # M5 修复:调用 is_safe_regex 前置校验,防 ReDoS
+            if not is_safe_regex(pattern):
+                return f"[error] unsafe regex pattern (potential ReDoS): {pattern}"
             try:
                 rgx = re.compile(pattern)
             except re.error as e:

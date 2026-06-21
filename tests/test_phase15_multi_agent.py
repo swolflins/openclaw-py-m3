@@ -332,9 +332,10 @@ class TestApprover4Paths:
 
     @pytest.mark.asyncio
     async def test_no_approver_default_passes(self):
-        """requires_approval=True 但没 set_approver → 当前实现默认通过(fail-open)。
+        """requires_approval=True 但没 set_approver → fail-closed(C1 修复)。
 
-        注:这是一个已知安全 trade-off,完整 4 路审批需要引入安全策略层。
+        C1 修复前:无 approver 时默认通过(fail-open),可被远程执行任意命令。
+        C1 修复后:无 approver 时 raise PermissionError(fail-closed)。
         """
         from openclaw.tools.registry import ToolRegistry
 
@@ -348,9 +349,9 @@ class TestApprover4Paths:
         reg.register(
             danger, name="danger", description="d", requires_approval=True,
         )
-        # 不 set_approver — 当前默认通过
-        out = await reg.call("danger", {"x": "ok"})
-        assert out == "ok"
+        # C1 修复:不 set_approver → fail-closed,raise PermissionError
+        with pytest.raises(PermissionError, match="fail-closed"):
+            await reg.call("danger", {"x": "ok"})
 
     @pytest.mark.asyncio
     async def test_non_dangerous_no_approval(self):

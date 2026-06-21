@@ -99,8 +99,12 @@ class PluginManager:
 
     def load_local(self, directory: Path | str) -> int:
         """扫描目录里所有 .py 文件,执行其 module-level `register(runtime)`。"""
-        d = Path(directory)
+        d = Path(directory).resolve()  # M13 修复:解析为绝对路径
         if not d.exists():
+            return 0
+        # M13 修复:校验目录路径,防止加载任意路径的代码
+        if not d.is_dir():
+            logger.warning("local_plugin_path_not_dir: %s", d)
             return 0
         count = 0
         for path in sorted(d.glob("*.py")):
@@ -141,14 +145,11 @@ class PluginManager:
         if inspect.iscoroutine(result):
             import asyncio
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # 在已运行的 loop 中 spawn task
-                    loop.create_task(result)
-                else:
-                    loop.run_until_complete(result)
+                # M13 修复:用 get_running_loop() 替代废弃的 get_event_loop()
+                loop = asyncio.get_running_loop()
+                loop.create_task(result)
             except RuntimeError:
-                # 无 loop 时新建
+                # 无运行中的 loop 时新建
                 asyncio.run(result)
 
 

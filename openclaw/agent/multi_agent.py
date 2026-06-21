@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from openclaw.agent.executor import PlanExecutor, PlanResult
@@ -240,11 +240,16 @@ class MultiAgentRoles:
         return r.content or "改用更简单的步骤,或拆得更细。"
 
     def _patch_plan(self, plan: Plan, failed: PlanStep, advice: str) -> Plan:
-        # 极简:在失败 step 后面追加一个 llm 反思 step,把 advice 当 hint
-        new = Plan(goal=plan.goal, steps=list(plan.steps), metadata=dict(plan.metadata))
+        # M12 修复:用 dataclasses.replace 深拷贝 PlanStep,避免浅拷贝污染
+        # 旧逻辑:list(plan.steps) 浅拷贝导致 PlanStep 对象跨 plan 共享
+        new_steps = [replace(s) for s in plan.steps]
+        new = Plan(goal=plan.goal, steps=new_steps, metadata=dict(plan.metadata))
+        # M12 修复:retry 保留原 kind/target,不写死 LLM
+        # 旧逻辑:retry_step.kind=StepKind.LLM 写死,若失败 step 是 TOOL,
+        # 会把工具名当 prompt 送 LLM
         retry_step = PlanStep(
             name=f"retry_{failed.id}",
-            kind=StepKind.LLM,
+            kind=failed.kind,  # 保留原 kind
             target=f"{failed.target}\n(Reflection 建议: {advice})",
             depends_on=list(failed.depends_on),
             max_retries=failed.max_retries,

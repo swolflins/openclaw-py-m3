@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import json
 import os
 from typing import Iterable
@@ -43,10 +44,19 @@ _PUBLIC_EXACT = {"/", ""}
 _ENV_VAR = "OPENCLAW_GATEWAY_ENV"
 _PROD_VALUES = {"production", "prod"}
 
+# H1 修复:dev 模式显式 opt-in — 未配置 token 时必须设 OPENCLAW_GATEWAY_DEV=1
+# 才允许无 token 运行(防止 uvicorn --host 0.0.0.0 绕过 host 检查)
+_DEV_ENV = "OPENCLAW_GATEWAY_DEV"
+
 
 def is_production_mode() -> bool:
     """NEW-1:返回当前是否处于生产模式。"""
     return os.environ.get(_ENV_VAR, "").strip().lower() in _PROD_VALUES
+
+
+def is_dev_mode() -> bool:
+    """H1 修复:返回是否显式开启了 dev 模式(允许无 token)。"""
+    return os.environ.get(_DEV_ENV, "").strip() in {"1", "true", "yes"}
 
 
 def require_token_in_production() -> None:
@@ -178,7 +188,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         # 允许测试时直接传(否则走 env)
         self._tokens = tokens if tokens is not None else _configured_tokens()
-        # 显式传了 host 才用,否则保持 dev 兼容(允许 0.0.0.0 + 空 token)
+        # H1 修复:默认 fail-closed — 无 token 时必须显式 OPENCLAW_GATEWAY_DEV=1
+        # 旧逻辑:仅当显式传 host="0.0.0.0" 才 fail-fast,但 uvicorn --host 0.0.0.0
+        # 时 create_app() 不感知绑定地址,检查被绕过。
+        # 新逻辑:无 token + 非 dev 模式 → 直接拒绝启动(不论 host)
         if host is not None and host == "0.0.0.0" and not self._tokens:
             raise RuntimeError(
                 "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
@@ -186,9 +199,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
             )
         if not self._tokens:
+            if not is_dev_mode():
+                raise RuntimeError(
+                    "[H1] OPENCLAW_GATEWAY_TOKEN 未设置且未显式开启 dev 模式。"
+                    "为防止未鉴权部署,启动被拒绝。请执行以下任一操作:\n"
+                    "  1. 设置 token:export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')\n"
+                    "  2. 本地开发:export OPENCLAW_GATEWAY_DEV=1"
+                )
             logger.warning(
-                "gateway_auth_disabled:OPENCLAW_GATEWAY_TOKEN 未设置,"
-                "所有 /v1/* 端点当前可被未认证访问(只用于本地开发)。"
+                "gateway_auth_disabled:OPENCLAW_GATEWAY_DEV=1 已显式开启,"
+                "所有 /v1/* 端点当前可被未认证访问(仅用于本地开发)。"
             )
         # Phase 25 review follow-up:稳定的 user_id 优先(轮换安全)。
         # 显式传参优先,否则读 OPENCLAW_GATEWAY_USER_ID。
@@ -226,7 +246,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         - 显式 ``user_id``(OPENCLAW_GATEWAY_USER_ID)→ 用它(单用户,轮换安全)
         - token 为 None(无 token)→ "anonymous"
         - token 在 ``token_to_user`` 映射里 → 用映射值(多用户,轮换安全)
-        - 都不命中 → ``token[:16]``(同 token 同 user,但**轮换不稳定**)
+        - 都不命中 → ``sha256(token)[:16]``(同 token 同 user,不泄露原始 token)
         """
         if user_id:
             return user_id
@@ -234,7 +254,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return "anonymous"
         if token in token_to_user:
             return token_to_user[token]
-        return token[:16]
+        # L5 修复:用 sha256 hash 替代 token[:16],防止日志泄露 token 前 16 字符
+        return "h_" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path

@@ -134,10 +134,16 @@ class BaseChannel(abc.ABC):
         if self.on_reply is not None:
             try:
                 if inspect.iscoroutinefunction(self.on_reply):
+                    # M3 修复:async on_reply 异常后应 return(可能已部分发送,再 send = 重复)
                     await self.on_reply(session_id, text)
+                    return
+                else:
+                    # M3 修复:sync on_reply 也要调用后 return(旧代码 fall-through 导致永不调用)
+                    self.on_reply(session_id, text)
                     return
             except Exception:
                 logger.exception("on_reply callback failed")
+                return  # M3 修复:on_reply 抛异常后不再 send(避免重复)
         try:
             await self.send(session_id, text)
         except Exception:

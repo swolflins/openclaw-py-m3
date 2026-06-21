@@ -352,7 +352,7 @@ def test_journal_reflect_dedupes_repeated_reflection(tmp_path: Path):
         def __init__(self, text: str) -> None:
             self.text = text
 
-        def reflect(self, entry):
+        async def reflect(self, entry):  # H4: async
             return self.text
 
     fixed = "# 固定反思\n\n这是一段不变化的反思内容。"

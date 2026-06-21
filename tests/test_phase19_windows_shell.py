@@ -18,6 +18,14 @@ from pathlib import Path
 import pytest
 
 
+# C1 修复后,requires_approval 工具在无 approver 时 fail-closed。
+# 测试中需要一个 always-approve 的 approver。
+def _set_test_approver(reg: ToolRegistry) -> None:
+    async def _ok(name, args):
+        return True
+    reg.set_approver(_ok)
+
+
 # ─────────────── _split_command ───────────────
 def test_split_posix_default():
     """非 Windows 走 POSIX(保持原行为)。"""
@@ -84,6 +92,7 @@ def _get_shell_tool(tmp_path: Path):
 def test_shell_exec_accepts_argv_list(tmp_path: Path):
     """shell_exec 直接接受 list[str] 形式(Windows 推荐,绕过 shlex 路径解析)。"""
     reg = _get_shell_tool(tmp_path)
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     out = asyncio.run(
         reg.call("shell_exec", {"command": ["echo", "hello", "world"], "timeout": 5})
     )
@@ -94,6 +103,7 @@ def test_shell_exec_accepts_argv_list(tmp_path: Path):
 def test_shell_exec_argv_list_runs_cwd(tmp_path: Path):
     """list 模式也遵守 cwd 参数。"""
     reg = _get_shell_tool(tmp_path)
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     (tmp_path / "test.txt").write_text("from argv list", encoding="utf-8")
     out = asyncio.run(
         reg.call("shell_exec", {"command": ["ls"], "cwd": str(tmp_path), "timeout": 5})
@@ -104,6 +114,7 @@ def test_shell_exec_argv_list_runs_cwd(tmp_path: Path):
 def test_shell_exec_argv_list_enforces_allowlist(tmp_path: Path):
     """list 模式:首词不在白名单应被拒。"""
     reg = _get_shell_tool(tmp_path)
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     with pytest.raises(PermissionError, match="not in allow-list"):
         asyncio.run(
             reg.call("shell_exec", {"command": ["rm", "-rf", "/"], "timeout": 5})
@@ -113,6 +124,7 @@ def test_shell_exec_argv_list_enforces_allowlist(tmp_path: Path):
 def test_shell_exec_empty_list_rejected(tmp_path: Path):
     """list 模式:空列表应被拒。"""
     reg = _get_shell_tool(tmp_path)
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     with pytest.raises(PermissionError, match="empty command"):
         asyncio.run(reg.call("shell_exec", {"command": [], "timeout": 5}))
 
@@ -120,6 +132,7 @@ def test_shell_exec_empty_list_rejected(tmp_path: Path):
 def test_shell_exec_string_mode_still_works(tmp_path: Path):
     """向后兼容:str 模式仍能跑。"""
     reg = _get_shell_tool(tmp_path)
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     out = asyncio.run(
         reg.call("shell_exec", {"command": "echo hi", "timeout": 5})
     )
@@ -130,6 +143,7 @@ def test_shell_exec_string_mode_still_works(tmp_path: Path):
 def test_shell_exec_string_mode_still_blocks_metachar(tmp_path: Path):
     """向后兼容:str 模式仍拦截 metachar。"""
     reg = _get_shell_tool(tmp_path)
+    _set_test_approver(reg)  # C1: shell_exec requires approval
     with pytest.raises(PermissionError, match="metachar"):
         asyncio.run(
             reg.call("shell_exec", {"command": "ls && rm -rf /", "timeout": 5})

@@ -124,6 +124,7 @@ class FakeAgentLoop:
 
 @pytest.fixture
 def deps(monkeypatch):
+    monkeypatch.setenv("OPENCLAW_GATEWAY_ADMIN_TOKEN", "admin-secret")  # H2: admin token
     from openclaw.gateway import deps as deps_mod
     deps_mod.reset_deps()
     agent = FakeAgentLoop()
@@ -381,7 +382,9 @@ def test_tools_call_not_found(client):
 
 def test_tools_set_approver_allow(client):
     # SEC-5:开启"一键全放行"必须 confirm="CONFIRM"
-    r = client.post("/v1/tools/approver", json={"approved": True, "confirm": "CONFIRM"})
+    # H2: 需要 X-Admin-Token header
+    r = client.post("/v1/tools/approver", json={"approved": True, "confirm": "CONFIRM"},
+                    headers={"X-Admin-Token": "admin-secret"})
     assert r.status_code == 200
     # 之后再调 shell_exec 应通过
     r2 = client.post("/v1/tools/call", json={"name": "shell_exec", "arguments": {"cmd": "ls"}})
@@ -389,7 +392,8 @@ def test_tools_set_approver_allow(client):
 
 
 def test_tools_set_approver_deny(client):
-    r = client.post("/v1/tools/approver", json={"approved": False})
+    r = client.post("/v1/tools/approver", json={"approved": False},
+                    headers={"X-Admin-Token": "admin-secret"})
     assert r.status_code == 200
     r2 = client.post("/v1/tools/call", json={"name": "shell_exec", "arguments": {"cmd": "ls"}})
     assert r2.status_code == 409

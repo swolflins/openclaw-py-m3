@@ -24,6 +24,14 @@ from openclaw.tools.registry import (
 )
 
 
+# C1 修复后,requires_approval 工具在无 approver 时 fail-closed。
+# 测试中需要一个 always-approve 的 approver。
+def _set_test_approver(reg: ToolRegistry) -> None:
+    async def _ok(name, args):
+        return True
+    reg.set_approver(_ok)
+
+
 # ─────────────── 1) 合法 arguments → call 成功 ───────────────
 
 def test_valid_arguments_call_succeeds():
@@ -324,6 +332,7 @@ def test_shell_exec_blocks_extra_argument_via_registry(tmp_path: Path):
 
     reg = ToolRegistry()
     register_builtin_tools(reg, shell_default_cwd=str(tmp_path), fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: shell_exec requires approval
 
     with pytest.raises(ToolValidationError) as exc:
         asyncio.run(
@@ -344,6 +353,7 @@ def test_shell_exec_blocks_wrong_type_via_registry(tmp_path: Path):
 
     reg = ToolRegistry()
     register_builtin_tools(reg, shell_default_cwd=str(tmp_path), fs_root=str(tmp_path))
+    _set_test_approver(reg)  # C1: shell_exec requires approval
 
     with pytest.raises(ToolValidationError) as exc:
         asyncio.run(

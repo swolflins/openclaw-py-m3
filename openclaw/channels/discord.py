@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from typing import Any, Optional
 import httpx
 
@@ -154,9 +155,18 @@ class DiscordChannel(BaseChannel):
         - 现在: pynacl 不可用时 ``return False`` + log error,让外层路由返 400。
         - 启动期已在 ``__init__`` / ``start`` 强制 production + public_key + pynacl 三者必须一致,
           所以"运行到这里还缺 pynacl"一定是误配置 → 直接拒。
+
+        **M8 修复**:增加 timestamp 新鲜度校验(±300s),防旧请求重放。
         """
         if not self.public_key:
             return True  # 没配公钥就不验(本地开发)
+        # M8 修复:校验 timestamp 新鲜度,防重放攻击
+        try:
+            ts = int(timestamp)
+        except (ValueError, TypeError):
+            return False
+        if abs(time.time() - ts) > 300:
+            return False
         try:
             from nacl.signing import VerifyKey
         except Exception:

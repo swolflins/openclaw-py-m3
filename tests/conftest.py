@@ -13,6 +13,8 @@ import pytest
 def _disable_gateway_rate_limit(monkeypatch):
     """SEC-12:测试期间关掉 gateway 限流,避免 burst=3 触发 429。"""
     monkeypatch.setenv("OPENCLAW_GATEWAY_RL_DISABLED", "1")
+    # H1 修复:测试期间显式开启 dev 模式,允许无 token 运行
+    monkeypatch.setenv("OPENCLAW_GATEWAY_DEV", "1")
 
 
 @pytest.fixture(autouse=True)

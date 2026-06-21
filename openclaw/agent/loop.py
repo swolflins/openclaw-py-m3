@@ -9,7 +9,9 @@ RT-4:支持历史窗口裁剪(防 token 爆)。
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -202,7 +204,9 @@ class Agent:
             tool_calls=all_tool_calls,
             session_id=self.session_id,
         )
-        await self.memory.append_turn(self.session_id, user_message, final.content)
+        # L7 修复:不再把"达到最大迭代"提示写回 memory(污染下一轮 context)
+        # 旧逻辑:await self.memory.append_turn(...) 会把这句提示存入 memory,
+        # 下一轮 LLM 会看到它,误以为上轮已正常完成。
         await self._maybe_journal(user_message, final, tool_results, started_at)
         return final
 
@@ -217,21 +221,26 @@ class Agent:
         if self.journal is None:
             return
         try:
-            entry = self.journal.record_session(
+            # M10 修复:record_session / generate_soul_proposal 内部做同步文件 IO,
+            # 用 asyncio.to_thread 包装避免阻塞事件循环
+            entry = await asyncio.to_thread(
+                self.journal.record_session,
                 session_id=self.session_id,
                 user_message=user_message,
                 response=response,
                 started_at=started_at,
                 tool_results=tool_results,
             )
-            # 同步 reflect(模板版不耗时)
+            # reflect 已经是 async(内部文件 IO 也需要 to_thread,但 reflect 本身
+            # 可能调 LLM 是 async 的,所以不能简单 to_thread;journal.py 内部的
+            # 文件 IO 在后续 M10-journal 修复中处理)
             try:
                 await self.journal.reflect(entry)
             except Exception as e:  # noqa: BLE001
                 logger.warning("journal reflect failed: %s", e)
             # 生成 SOUL proposal
             try:
-                self.journal.generate_soul_proposal(entry)
+                await asyncio.to_thread(self.journal.generate_soul_proposal, entry)
             except Exception as e:  # noqa: BLE001
                 logger.warning("journal soul_proposal failed: %s", e)
         except Exception as e:  # noqa: BLE001
@@ -265,7 +274,11 @@ class AgentLoop:
         self.history_soft_window = history_soft_window
         self.recall_top_k = recall_top_k
         self.journal = journal
-        self._agents: dict[str, Agent] = {}
+        # M11 修复:用 OrderedDict + maxsize 实现 LRU 淘汰
+        # 旧逻辑:普通 dict 只追加不淘汰,IM bot 每个 chat 一个 session_id,
+        # 长期运行 Agent(持有 tools/memory/llm 引用)无界增长,内存只增不减。
+        self._agents: OrderedDict[str, Agent] = OrderedDict()
+        self._max_agents = 128  # 最大缓存的 Agent 数量
 
     def _get_agent(self, session_id: str) -> Agent:
         if session_id not in self._agents:
@@ -280,6 +293,12 @@ class AgentLoop:
                 recall_top_k=self.recall_top_k,
                 journal=self.journal,
             )
+            # M11 修复:超过上限时淘汰最久未访问的 Agent
+            while len(self._agents) > self._max_agents:
+                self._agents.popitem(last=False)  # FIFO 淘汰最旧的
+        else:
+            # M11 修复:移到末尾(标记为最近访问)
+            self._agents.move_to_end(session_id)
         return self._agents[session_id]
 
     async def handle(self, session_id: str, user_message: str) -> AgentResponse:

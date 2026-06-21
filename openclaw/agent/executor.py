@@ -153,6 +153,10 @@ class PlanExecutor:
                 return sr
 
             outs = await asyncio.gather(*[_run_one(s) for s in pending], return_exceptions=False)
+            # M1 修复:不再 break — 继续追加所有 step 的结果
+            # 旧逻辑:critical 失败后 break,排在后面的非 critical step 的
+            # StepResult 不再 append 到 result.steps、不触发 on_step_done,
+            # 导致结果丢失、统计偏差、step_cache 拿不到状态。
             for s, sr in zip(pending, outs):
                 step_results[s.id] = sr
                 result.steps.append(sr)
@@ -162,8 +166,7 @@ class PlanExecutor:
                     except Exception:  # pragma: no cover
                         logger.exception("on_step_done hook failed")
                 if sr.status == StepStatus.FAILED and s.critical:
-                    failed = s.id
-                    break
+                    failed = s.id  # 记录但不 break,继续处理剩余 step
 
         if failed:
             result.error = f"plan failed at step {failed}"

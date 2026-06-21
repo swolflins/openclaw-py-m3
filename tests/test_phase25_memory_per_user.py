@@ -395,12 +395,15 @@ def test_long_term_isolated_between_users(deps, _clear_token_env):
 # -------- 额外:无 token_to_user 映射时,token 自身[:16] 当 user_id --------
 
 def test_default_user_id_uses_token_prefix_when_no_mapping(deps, _clear_token_env):
-    """没传 token_to_user 时,user_id = token[:16](同 token 同 user)。"""
+    """没传 token_to_user 时,user_id = "h_"+sha256(token)[:16](同 token 同 user)。
+
+    L5 修复:user_id 从 token[:16] 改为 sha256 hash,不泄露原始 token。
+    """
+    import hashlib
     client = _make_client(deps, tokens=TOKENS, token_to_user=None)
 
-    # token-A-...[:16] = "token-A-padded-t"
-    expected_user = TOK_A[:16]
-    assert expected_user == "token-A-padded-t"
+    # L5 修复:user_id = "h_" + sha256(token)[:16]
+    expected_user = "h_" + hashlib.sha256(TOK_A.encode()).hexdigest()[:16]
 
     r = client.post(
         "/v1/memory/short",

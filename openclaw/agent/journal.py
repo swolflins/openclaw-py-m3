@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -53,8 +54,11 @@ class Reflector(Protocol):
 
     默认实现:`TemplateReflector`(deterministic,无 LLM)。
     真实实现:`LLMReflector`(用 OpenAI/Anthropic)。
+
+    H4 修复:Protocol 改为 async,与 LLMReflector 实现一致,
+    避免 AgentJournal.reflect 不 await 导致 AttributeError。
     """
-    def reflect(self, entry: JournalEntry) -> str: ...
+    async def reflect(self, entry: JournalEntry) -> str: ...
 
 
 # ──────────── 反思器实现 ────────────
@@ -85,7 +89,8 @@ class TemplateReflector:
 {suggestions}
 """
 
-    def reflect(self, entry: JournalEntry) -> str:
+    async def reflect(self, entry: JournalEntry) -> str:
+        # H4 修复:改为 async 以匹配 Reflector Protocol
         # 表现分析
         analysis_lines: list[str] = []
         n_tools = len(entry.tool_calls)
@@ -192,7 +197,9 @@ class LLMReflector:
             return f"# LLM 反思\n\n{result.content or '(空响应)'}"
         except Exception as e:  # noqa: BLE001
             logger.warning("LLM 反思失败,降级: %s", e)
-            return TemplateReflector().reflect(entry) + "\n\n> ⚠️ LLM 反思失败,已用模板兜底"
+            # H4 修复:TemplateReflector.reflect 现在是 async,需要 await
+            fallback = await TemplateReflector().reflect(entry)
+            return fallback + "\n\n> ⚠️ LLM 反思失败,已用模板兜底"
 
 
 # ──────────── Journal 主体 ────────────
@@ -233,7 +240,10 @@ class AgentJournal:
         date_part = entry.timestamp[:10]  # YYYY-MM-DD
         dir_ = self.root / date_part
         dir_.mkdir(parents=True, exist_ok=True)
-        return str(dir_ / f"sess_{entry.session_id[:24]}.md")
+        # M6 修复:对 session_id 做 sanitize,防路径穿越
+        # 旧逻辑直接拼 entry.session_id[:24],传入 ../../../tmp/evil 可写到 journal root 之外
+        safe_sid = re.sub(r"[^A-Za-z0-9._:\-]", "_", entry.session_id[:24])
+        return str(dir_ / f"sess_{safe_sid}.md")
 
     @staticmethod
     def _hash_session(user_message: str, ts: str) -> str:
@@ -340,11 +350,14 @@ class AgentJournal:
         3. ``head`` 只生成一次(含一份占位段),去重后的反思按顺序追加在
            占位段之后,占位段不再被重复写入。
         """
-        reflection = self.reflector.reflect(entry)
+        reflection = await self.reflector.reflect(entry)  # H4 修复:await async reflector
         entry.reflections.append(reflection)
 
         path = Path(self._entry_filename(entry))
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        # M10 修复:文件 IO 用 asyncio.to_thread 包装,避免阻塞事件循环
+        existing = await asyncio.to_thread(
+            lambda: path.read_text(encoding="utf-8") if path.exists() else ""
+        )
         existing_reflections = self._extract_reflections(existing)
 
         # seen 真正参与去重:已落盘反思优先,再本次新反思,按 strip 判等保序。
@@ -364,7 +377,8 @@ class AgentJournal:
         tail = "".join("\n" + refl + "\n" for refl in ordered)
         # 归一连续空行(head + tail),5 个空行 → 1 个空行。
         final_text = self._collapse_blank_lines(head + tail)
-        path.write_text(final_text, encoding="utf-8")
+        # M10 修复:文件写入也用 asyncio.to_thread
+        await asyncio.to_thread(path.write_text, final_text, encoding="utf-8")
         return reflection
 
     @staticmethod

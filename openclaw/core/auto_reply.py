@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 
 from openclaw.core.logging import get_logger
 from openclaw.core.rate_limit import RateLimiter
+from openclaw.core.sanitize import is_safe_regex
 
 logger = get_logger(__name__)
 
@@ -76,7 +77,11 @@ class AutoReplyDecision:
 
 def _parse_hhmm(s: str) -> int:
     h, m = s.split(":")
-    return int(h) * 60 + int(m)
+    hi, mi = int(h), int(m)
+    # M9 修复:校验范围(旧逻辑不校验,h<0/h>23/m<0/m>59 静默通过)
+    if not (0 <= hi < 24 and 0 <= mi < 60):
+        raise ValueError(f"invalid time: {s} (hour 0-23, minute 0-59)")
+    return hi * 60 + mi
 
 
 def _in_quiet(now_minute: int, q: tuple[str, str]) -> bool:
@@ -97,9 +102,13 @@ class AutoReplyManager:
         self._trig_re = [
             re.compile(re.escape(t)) for t in self.cfg.triggers
         ]
-        self._blk_re = [
-            re.compile(p) for p in self.cfg.blacklist
-        ]
+        # M9 修复:blacklist 正则前置 is_safe_regex 校验,防 ReDoS
+        self._blk_re = []
+        for p in self.cfg.blacklist:
+            if is_safe_regex(p):
+                self._blk_re.append(re.compile(p))
+            else:
+                logger.warning("auto_reply_blacklist_unsafe_regex:跳过不安全的正则模式: %s", p)
         # 统计
         self._stats = {
             "allow": 0, "block_blacklist": 0, "block_quiet": 0,
@@ -119,7 +128,7 @@ class AutoReplyManager:
     ) -> AutoReplyDecision:
         meta = metadata or {}
         cfg = self.cfg
-        now = now or _dt.datetime.now()
+        now = now or _dt.datetime.now(_dt.timezone.utc)  # M9 修复:用 UTC tz-aware datetime
 
         # 0) CH-2:user allowFrom 白名单(空 = 不限制;非空 = 只放行列表中的 user_id)
         if cfg.allow_from and user_id not in cfg.allow_from:

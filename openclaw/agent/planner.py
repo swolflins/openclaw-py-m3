@@ -10,6 +10,7 @@ LLM 生成 plan 的接口留给上层(multi_agent 或 AgentLoop 选用)。
 from __future__ import annotations
 
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -87,10 +88,10 @@ class Plan:
             for d in s.depends_on:
                 adj[d].append(s.id)
                 indeg[s.id] += 1
-        queue = [nid for nid, c in indeg.items() if c == 0]
+        queue = deque(nid for nid, c in indeg.items() if c == 0)  # L8 修复:用 deque 替代 list
         visited = 0
         while queue:
-            n = queue.pop(0)
+            n = queue.popleft()  # L8 修复:O(1) popleft 替代 O(n) pop(0)
             visited += 1
             for m in adj[n]:
                 indeg[m] -= 1

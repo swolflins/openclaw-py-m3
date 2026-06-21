@@ -1,9 +1,10 @@
 """/v1/tools 列出 / 调用 / 审批。"""
 from __future__ import annotations
 
+import os
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from openclaw.gateway import metrics as m
@@ -18,6 +19,23 @@ def _registry():
     if deps.agent_loop is None:
         return None
     return getattr(deps.agent_loop, "tools", None)
+
+
+def _check_admin(request: Request) -> None:
+    """H2 修复:审批模式切换需要管理员 token。
+
+    - ``OPENCLAW_GATEWAY_ADMIN_TOKEN`` 未配置 → 端点禁用(403)
+    - 请求头 ``X-Admin-Token`` 不匹配 → 403
+    """
+    admin_token = os.environ.get("OPENCLAW_GATEWAY_ADMIN_TOKEN", "").strip()
+    if not admin_token:
+        raise HTTPException(
+            403,
+            "approver mode change is disabled: OPENCLAW_GATEWAY_ADMIN_TOKEN not configured",
+        )
+    provided = request.headers.get("X-Admin-Token", "").strip()
+    if not provided or provided != admin_token:
+        raise HTTPException(403, "admin token required to change approver mode")
 
 
 @router.get("")
@@ -67,13 +85,17 @@ class ApproveRequest(BaseModel):
 
 
 @router.post("/approver")
-async def set_approver_mode(req: ApproveRequest) -> dict:
+async def set_approver_mode(req: ApproveRequest, request: Request) -> dict:
     """设置"是否自动批准"。
 
     安全(SEC-5):
     - 启用"全部放行"必须 confirm="CONFIRM" 否则 403
     - 关闭永远放行(approved=False)无 confirm 要求
+
+    H2 修复:需要管理员 token(X-Admin-Token header)才能切换审批模式,
+    防止任意有效 token 关闭全局审批。
     """
+    _check_admin(request)  # H2 修复:管理员鉴权
     reg = _registry()
     if reg is None:
         raise HTTPException(503, "agent_loop / tools not attached")
