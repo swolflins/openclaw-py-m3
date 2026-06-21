@@ -234,7 +234,6 @@ def test_completion_invalid_shell():
 
 def test_run_no_provider():
     """无 provider 配置时 run 应给出友好错误(CLIError)。"""
-    from openclaw.cli.errors import CLIError
 
     result = runner.invoke(app, ["run", "--once", "hi"])
     assert result.exit_code != 0

@@ -81,7 +81,7 @@ def logs(
         recent = all_lines[-lines:] if len(all_lines) > lines else all_lines
         if level:
             lv = level.lower()
-            recent = [l for l in recent if lv in l.lower()]
+            recent = [line for line in recent if lv in line.lower()]
 
         cli_ctx.output.plain("\n".join(recent) if recent else "(无日志)")
         cli_ctx.output.print({"file": str(log_file), "shown": len(recent), "total": len(all_lines)})

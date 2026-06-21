@@ -16,7 +16,7 @@ from typing import Optional
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_CONFIG
+from openclaw.cli.errors import CLIError
 
 
 def _cron_app() -> typer.Typer:
