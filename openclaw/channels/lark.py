@@ -96,7 +96,7 @@ class LarkChannel(BaseChannel):
 
     @property
     def available(self) -> bool:
-        return _HAS_LARK and bool(self.settings.app_id) and bool(self.settings.app_secret)
+        return _HAS_LARK and bool(self.settings.app_id) and bool(self.settings.app_secret.get_secret_value())
 
     async def start(self) -> None:
         if not _HAS_LARK:
@@ -253,7 +253,7 @@ class LarkChannel(BaseChannel):
         while not self._stopped.is_set():
             self._ws_client = lark.ws.Client(
                 self.settings.app_id,
-                self.settings.app_secret,
+                self.settings.app_secret.get_secret_value(),
                 event_handler=handler,
                 log_level=lark.LogLevel.INFO,
             )
@@ -404,7 +404,7 @@ class LarkChannel(BaseChannel):
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
         body = {
             "app_id": self.settings.app_id,
-            "app_secret": self.settings.app_secret,
+            "app_secret": self.settings.app_secret.get_secret_value(),
         }
         try:
             async with httpx.AsyncClient(timeout=10) as client:

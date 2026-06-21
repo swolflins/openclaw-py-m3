@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from openclaw.core.errors import ConfigError
 from openclaw.core.logging import get_logger
@@ -36,7 +36,9 @@ except ImportError:  # pragma: no cover
 class ProviderConfig(BaseModel):
     name: str  # openai_compat / anthropic / gemini / ollama / router
     model: str
-    api_key: Optional[str] = None
+    # Phase 25/b9:api_key 改用 SecretStr,避免日志 / repr 泄漏明文。
+    # 只在工厂 / 真正发请求时调 .get_secret_value() 取出字符串。
+    api_key: Optional[SecretStr] = None
     base_url: Optional[str] = None
     extra: dict[str, Any] = Field(default_factory=dict)
 

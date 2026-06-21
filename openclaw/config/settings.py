@@ -8,14 +8,18 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class OpenAISettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENAI_", env_file=".env", extra="ignore")
 
-    api_key: str = Field(default="sk-replace-me", description="OpenAI 兼容 API Key")
+    # Phase 25/b9:api_key 改用 SecretStr,避免日志 / repr 泄漏明文。
+    api_key: SecretStr = Field(
+        default=SecretStr("sk-replace-me"),
+        description="OpenAI 兼容 API Key",
+    )
     base_url: str = Field(default="https://api.deepseek.com/v1", description="API 根 URL")
     model: str = Field(default="deepseek-chat", description="默认模型 id")
     timeout: float = Field(default=60.0, description="单次请求超时(秒)")
@@ -25,9 +29,11 @@ class LarkSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LARK_", env_file=".env", extra="ignore")
 
     app_id: str = Field(default="", description="飞书自建应用 App ID")
-    app_secret: str = Field(default="", description="飞书 App Secret")
-    verification_token: Optional[str] = Field(default=None)
-    encrypt_key: Optional[str] = Field(default=None)
+    # Phase 25/b9:app_secret 改用 SecretStr,避免日志 / repr 泄漏明文。
+    # 消费侧 (openclaw.channels.lark) 调 .get_secret_value() 取字符串。
+    app_secret: SecretStr = Field(default=SecretStr(""), description="飞书 App Secret")
+    verification_token: Optional[SecretStr] = Field(default=None)
+    encrypt_key: Optional[SecretStr] = Field(default=None)
     use_ws: bool = Field(default=True, description="True=长连接, False=Webhook")
     webhook_url: Optional[str] = Field(default=None)
 

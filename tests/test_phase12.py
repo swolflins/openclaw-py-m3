@@ -275,7 +275,8 @@ def test_config_load_yaml_with_env_interp(tmp_path):
     try:
         loader = ConfigLoader(cfg)
         c = loader.load()
-        assert c.providers[0].api_key == "real-secret"
+        # Phase 25/b9:api_key 改 SecretStr,需 .get_secret_value() 取明文
+        assert c.providers[0].api_key.get_secret_value() == "real-secret"
     finally:
         del os.environ["MY_PROVIDER_KEY"]
 

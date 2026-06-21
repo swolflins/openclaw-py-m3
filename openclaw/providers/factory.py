@@ -44,7 +44,7 @@ class ProviderFactory:
     @staticmethod
     def _build_openai_compat(cfg: ProviderConfig) -> BaseLLMProvider:
         return OpenAICompatProvider(
-            api_key=cfg.api_key or "sk-placeholder",
+            api_key=cfg.api_key.get_secret_value() if cfg.api_key else "sk-placeholder",
             base_url=cfg.base_url or "https://api.deepseek.com/v1",
             model=cfg.model,
             timeout=float(cfg.extra.get("timeout", 60.0)),
@@ -54,7 +54,7 @@ class ProviderFactory:
     def _build_anthropic(cfg: ProviderConfig) -> BaseLLMProvider:
         from openclaw.providers.anthropic import AnthropicProvider
         return AnthropicProvider(
-            api_key=cfg.api_key or "",
+            api_key=cfg.api_key.get_secret_value() if cfg.api_key else "",
             model=cfg.model,
             base_url=cfg.base_url,
             max_tokens=int(cfg.extra.get("max_tokens", 4096)),
@@ -64,7 +64,7 @@ class ProviderFactory:
     def _build_gemini(cfg: ProviderConfig) -> BaseLLMProvider:
         from openclaw.providers.gemini import GeminiProvider
         return GeminiProvider(
-            api_key=cfg.api_key or "",
+            api_key=cfg.api_key.get_secret_value() if cfg.api_key else "",
             model=cfg.model,
         )
 
