@@ -106,6 +106,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     Phase 25:增加 ``host`` 显式参数 — 当 host="0.0.0.0" 且 tokens 为空时,
     直接抛 RuntimeError(双层保险)。127.0.0.1 仍允许无 token(纯本地开发)。
+
+    Phase 25/a5:增加 ``token_to_user`` 映射 — 鉴权通过后,
+    把 ``request.state.user_id`` 设为该映射的 user_id;
+    缺省/找不到时,把 token 自身[:16] 作为 user_id(同 token 同 user)。
     """
 
     def __init__(
@@ -114,6 +118,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         *,
         tokens: list[str] | None = None,
         host: str | None = None,
+        token_to_user: dict[str, str] | None = None,
     ) -> None:
         super().__init__(app)
         # 允许测试时直接传(否则走 env)
@@ -130,14 +135,34 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 "gateway_auth_disabled:OPENCLAW_GATEWAY_TOKEN 未设置,"
                 "所有 /v1/* 端点当前可被未认证访问(只用于本地开发)。"
             )
+        # Phase 25/a5:token → user_id 映射(可选)。
+        # 没传或没命中映射时,dispatch 里用 token[:16] 作为 user_id。
+        self._token_to_user = dict(token_to_user) if token_to_user else {}
+
+    @staticmethod
+    def _resolve_user_id(token: str | None, token_to_user: dict[str, str]) -> str:
+        """根据 token 解析 user_id。
+
+        - token 为 None(无 token)→ "anonymous"
+        - token 在映射里 → 用映射值
+        - 都不命中 → 用 ``token[:16]``(同 token 同 user,简单稳定)
+        """
+        if token is None:
+            return "anonymous"
+        if token in token_to_user:
+            return token_to_user[token]
+        return token[:16]
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         if _is_public(path):
+            # 公开路径也挂一个 user_id(anonymous)以保持下游一致性
+            request.state.user_id = "anonymous"
             return await call_next(request)
 
         # 没配置 token → 放行(仅 dev 模式);但记 warning
         if not self._tokens:
+            request.state.user_id = "anonymous"
             return await call_next(request)
 
         provided = _extract_token(request)
@@ -148,15 +173,25 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": "missing or invalid gateway token"},
                 headers={"WWW-Authenticate": 'Bearer realm="openclaw-gateway"'},
             )
+        # 鉴权通过 → 挂 user_id 到 request.state
+        request.state.user_id = self._resolve_user_id(provided, self._token_to_user)
         return await call_next(request)
 
 
-def install_auth(app, tokens: list[str] | None = None, host: str | None = None) -> None:
+def install_auth(
+    app,
+    tokens: list[str] | None = None,
+    host: str | None = None,
+    token_to_user: dict[str, str] | None = None,
+) -> None:
     """把 AuthMiddleware 挂到 FastAPI app(简单工厂,测试用)。
 
     Phase 25:``host`` 透传给 AuthMiddleware — 测试用 127.0.0.1 即可绕过 fail-fast。
+
+    Phase 25/a5:``token_to_user`` 透传给 AuthMiddleware — 给 token 配 user_id,
+    缺省/未命中时 dispatch 用 ``token[:16]`` 作为 user_id。
     """
-    app.add_middleware(AuthMiddleware, tokens=tokens, host=host)
+    app.add_middleware(AuthMiddleware, tokens=tokens, host=host, token_to_user=token_to_user)
 
 
 def require_token_or_403(provided: str | None) -> None:

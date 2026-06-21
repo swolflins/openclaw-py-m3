@@ -294,9 +294,16 @@ def test_sessions_new(client, deps):
 
 
 # -------- memory --------
+#
+# Phase 25/a5:per-user 隔离 — 路由层会给 caller 的 scope 加 ``user_id:`` 前缀。
+# test_phase8 的 client 没传 token → user_id = "anonymous" → 实际 scope key 为
+# ``"anonymous:u1"``。这里用常量 ``_ANON_SCOPE = "anonymous:u1"`` 与路由行为对齐。
+
+_ANON_SCOPE = "anonymous:u1"
+
 
 def test_memory_short_get(client, deps):
-    deps.agent_loop.memory.short.store["u1"] = [FakeMsg("user", "hi")]
+    deps.agent_loop.memory.short.store[_ANON_SCOPE] = [FakeMsg("user", "hi")]
     r = client.get("/v1/memory/short", params={"scope": "u1", "k": 10})
     assert r.status_code == 200
     assert r.json()["count"] == 1
@@ -305,12 +312,12 @@ def test_memory_short_get(client, deps):
 def test_memory_short_post(client, deps):
     r = client.post("/v1/memory/short", json={"scope": "u1", "role": "user", "content": "manual"})
     assert r.status_code == 200
-    msgs = deps.agent_loop.memory.short.store["u1"]
+    msgs = deps.agent_loop.memory.short.store[_ANON_SCOPE]
     assert msgs[0].content == "manual"
 
 
 def test_memory_short_clear(client, deps):
-    deps.agent_loop.memory.short.store["u1"] = [FakeMsg("user", "x")]
+    deps.agent_loop.memory.short.store[_ANON_SCOPE] = [FakeMsg("user", "x")]
     r = client.delete("/v1/memory/short/u1")
     assert r.status_code == 200
     assert deps.agent_loop.memory.short.store == {}

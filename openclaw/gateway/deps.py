@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from openclaw.agent.loop import AgentLoop
 from openclaw.core.logging import get_logger
+from fastapi import Request
 
 logger = get_logger(__name__)
 
@@ -95,3 +96,21 @@ def reset_deps() -> None:
     """测试用 — 还原默认空 deps。"""
     global _deps
     _deps = None
+
+
+# ---------------- Phase 25/a5:per-user 隔离 ----------------
+
+def current_user_id(request: Request) -> str:
+    """从 request.state 取 user_id(由 AuthMiddleware 注入)。
+
+    - 有 token 且配置了 token_to_user → 映射里的 user_id
+    - 有 token 但没映射 → ``token[:16]``
+    - 没 token(无鉴权 / dev 模式 / 公开路径)→ ``"anonymous"``
+
+    用途:各路由(尤其 ``/v1/memory/*``)拿这个值给 scope 加 user 前缀,
+    防止横向越权(token A 读到 token B 的记忆)。
+    """
+    uid = getattr(request.state, "user_id", None)
+    if isinstance(uid, str) and uid:
+        return uid
+    return "anonymous"
