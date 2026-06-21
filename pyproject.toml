@@ -25,6 +25,8 @@ dependencies = [
     "orjson>=3.10",
     "tenacity>=8.2",
     "structlog>=24.1",
+    # Phase 25 / a4:Tool Registry 强制校验 LLM 输出的 JSON Schema
+    "jsonschema>=4.0",
 ]
 
 [project.optional-dependencies]

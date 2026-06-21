@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from openclaw.core.logging import get_logger
+from openclaw.core.sanitize import strip_external_content
 from openclaw.llm.base import BaseLLMProvider, ChatMessage, ToolCall
 from openclaw.memory.scoped import ScopedMemory
 from openclaw.tools.registry import ToolRegistry
@@ -171,13 +172,22 @@ class Agent:
                 logger.info("[agent %s] tool call: %s(%s)", self.session_id, tc.name, tc.arguments)
                 # SEC-2 修复:必须走 registry.call(),触发 approver 审批流 + 限流 + 审计
                 # 旧实现 self.tools.get(tc.name)(**tc.arguments) 绕过了一切审批
+                # Phase 25 / a4:registry.call() 会先用 JSON Schema 强校验 arguments,
+                # 不合法直接抛 ToolValidationError,落到下面 except 走 sanitize + 截断回灌
                 try:
                     output = await self.tools.call(tc.name, dict(tc.arguments or {}))
                     tool_content = str(output)
                     tool_results.append({"name": tc.name, "result": tool_content})
                 except Exception as e:
                     logger.exception("tool %s failed", tc.name)
-                    tool_content = f"[tool error] {type(e).__name__}: {e}"
+                    # Phase 25 / a4:工具异常信息可能含不可信外部内容(参数本身、traceback),
+                    # 回灌到 messages 给 LLM 前必须过 sanitize 防提示词注入,
+                    # 并截到 200 字符防 token 爆 / 防恶意大字段冲掉上下文
+                    raw = f"[tool error] {type(e).__name__}: {e}"
+                    safe = strip_external_content(raw)
+                    if len(safe) > 200:
+                        safe = safe[:200] + "..."
+                    tool_content = safe
                     tool_results.append({"name": tc.name, "result": tool_content, "error": True})
 
                 messages.append(
