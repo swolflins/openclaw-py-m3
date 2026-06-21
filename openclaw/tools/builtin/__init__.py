@@ -7,6 +7,7 @@
 - HTTP:    http_get / http_post / http_request
 - CRON:    cron_add / cron_list / cron_remove
 - SANDBOX: docker_run_python / docker_exec / docker_pull / docker_list_images
+- BROWSER: browse_url / browser_extract_text / browser_close(可选,需 playwright)
 
 参数 include / exclude 用于精确控制。
 """
@@ -30,6 +31,7 @@ def register_builtin_tools(
     shell_allowed: list[str] | None = None,
     shell_default_cwd: str = ".",
     http_allowed_hosts: list[str] | None = None,
+    browser_allowed_domains: list[str] | None = None,
     include: list[str] | None = None,
     exclude: list[str] | None = None,
 ) -> None:
@@ -48,6 +50,15 @@ def register_builtin_tools(
         register_docker_tools(registry)
     except Exception as e:  # pragma: no cover
         logger.info("docker_tools_skipped", reason=str(e))
+
+    # playwright 可选 — 没装时跳过(不阻断)
+    try:
+        from openclaw.tools.builtin.playwright_tool import register_browser_tools
+        register_browser_tools(
+            registry, allowed_domains=browser_allowed_domains,
+        )
+    except ImportError as e:
+        logger.info("browser_tools_skipped", reason=str(e))
 
     # 兼容老 demo
     @registry.tool(category=ToolCategory.UTILITY, permission="safe")
