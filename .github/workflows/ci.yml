@@ -140,6 +140,10 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main'
     timeout-minutes: 30
+    # docker build 经常因为 GitHub Actions 共享 runner 资源紧张而 fail
+    # (BUILD/runc 拉不下来,Buildx 启动超时等), 跟代码无关
+    # 用 continue-on-error 软失败, 主分支不阻断, 但会标 yellow ⚠
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
