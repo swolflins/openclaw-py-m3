@@ -19,6 +19,27 @@ from openclaw.config.settings import LarkSettings
 
 logger = logging.getLogger(__name__)
 
+# CH-1:用来区分"未拉取"和"已拉取到 None"。None 在业务上是合法值(可能后端返 code!=0),
+# 启动期 fail-fast 靠"还是 sentinel"判断,这样能精准区分拉没拉过。
+class _UnsetType:
+    """单例 sentinel:表示 bot_open_id 还没拉过。"""
+
+    _instance: "_UnsetType | None" = None
+
+    def __new__(cls) -> "_UnsetType":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "<UNSET>"
+
+    def __bool__(self) -> bool:  # 让 if bot_open_id 永远 False(未拉过时视作空)
+        return False
+
+
+_UNSET = _UnsetType()
+
 
 def _is_bot_mentioned(mentions: Optional[list], bot_open_id: Optional[str]) -> bool:
     """CH-1:判断飞书事件里是否 @ 了 bot。
@@ -65,6 +86,11 @@ class LarkChannel(BaseChannel):
         self._task: Optional[asyncio.Task] = None
         # session_id → 最近一条 message_id,send() 用它 reply 原消息
         self._last_msg_id: dict[str, str] = {}
+        # CH-1:bot_open_id 缓存槽位(per-instance)。启动期填,运行时只读。
+        # 用一个明确的 sentinel 区分"未拉取"和"已拉取为 None"(即便后端返 None 也算成功,直接返回即可)。
+        self._bot_open_id: Any = _UNSET
+        # 单实例内的协程锁:多协程同时首次调用时只让一个真的发请求,其他 await 同一个结果。
+        self._bot_open_id_lock = asyncio.Lock()
 
     # ---------- 公共接口 ----------
 
@@ -84,6 +110,17 @@ class LarkChannel(BaseChannel):
             raise NotImplementedError(
                 "Webhook 模式尚未实现,当前仅支持长连接模式(LARK_USE_WS=true)。"
             )
+
+        # CH-1:启动期先 await 一次 bot_open_id(同步进 WS loop 之前)。
+        # 修 phase 25 / a3:之前是同步函数内部用 asyncio.run(),在 running loop 里会 RuntimeError
+        # 被静默吞掉。失败要透传 —— 凭据错就早 fail,不要带着坏状态进 WS。
+        try:
+            await self._fetch_bot_open_id()
+        except RuntimeError as e:
+            raise RuntimeError(f"启动 Lark 渠道失败:无法获取 bot open_id({e})") from e
+        # 允许 open_id 为 None(后端返 200 但 data 缺失);只 log 不 raise,_is_bot_mentioned 会兜底。
+        if self._bot_open_id is None:
+            logger.warning("Lark 启动:bot_open_id 为空,@ 检测将回退到 mentioned_type")
 
         # 在后台线程跑 lark WS,避免阻塞 asyncio loop
         self._task = asyncio.create_task(self._ws_loop())
@@ -119,34 +156,69 @@ class LarkChannel(BaseChannel):
             return
         await self._reply_to_lark(message_id, text)
 
-    def _fetch_bot_open_id(self) -> Optional[str]:
-        """CH-1:拉一次 bot 自己的 open_id(缓存到 self._bot_open_id)。
+    async def _fetch_bot_open_id(self) -> Optional[str]:
+        """CH-1:异步拉一次 bot 自己的 open_id,并缓存到 self._bot_open_id。
 
-        用 im/v1/bot_info 接口。失败返回 None(不致命 — 群 @ 检测会回退到 mentioned_type)。
+        用 im/v1/bots/me 接口。**修 phase 25 / a3**:
+        - 原来是同步函数内部用 ``asyncio.run()``,在 async 上下文里会永远抛
+          ``RuntimeError: asyncio.run() cannot be called from a running event loop``,
+          异常被 except 静默吞掉 → bot_open_id 永远拿不到 → 群 @ 检测失效。
+        - 现在改 ``async def``, 内部用 ``await`` 调底层 client(httpx.AsyncClient)。
+        - 加 per-instance 缓存 + 协程锁:同一进程 / 同一 channel 实例内只拉 1 次,
+          并发首次调用也只发 1 个网络请求,后续直接返回缓存。
+        - 启动期调用失败 → 让 RuntimeError 透传(``start()`` 把它包成 RuntimeError 抛出),
+          不要静默吞。
+
+        返回值:open_id 字符串(可能为 None —— 后端返 200 但 data.bot.open_id 缺失)。
         """
-        if getattr(self, "_bot_open_id", None):
-            return self._bot_open_id
-        try:
+        # 命中缓存(包含 None) → 直接返回。
+        # 注意:None 是合法值(后端可能返 code!=0 / data 缺失),用 sentinel 区分"未拉取" vs "拉到 None"。
+        cached = self._bot_open_id
+        if cached is not _UNSET:
+            # cached 此时是 str 或 None(都是合法缓存值);typing 视角下是 Any,强转一下
+            return None if cached is None else str(cached)
+
+        async with self._bot_open_id_lock:
+            # 再次检查:进锁的协程可能已经有别的协程在锁内填好了缓存。
+            cached = self._bot_open_id
+            if cached is not _UNSET:
+                return None if cached is None else str(cached)
+
             import httpx
-            import asyncio
-            token = asyncio.run(self._get_tenant_token())
+
+            token = await self._get_tenant_token()
             if not token:
-                return None
-            r = httpx.get(
-                "https://open.feishu.cn/open-apis/im/v1/bots/me",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
-            data = r.json()
-            bot = data.get("data", {}).get("bot", {})
+                # 拿不到 token 不算"成功拉到 None",也不缓存,让上层决定怎么办。
+                raise RuntimeError("Lark: 拿不到 tenant_access_token,无法拉 bot open_id")
+
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    r = await client.get(
+                        "https://open.feishu.cn/open-apis/im/v1/bots/me",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+            except Exception as e:
+                # 网络层错误(timeout / ConnectError / DNS 失败等)也包成 RuntimeError,
+                # 启动期让 start() 透传,不要让 httpx 原始异常混进外层(以及避免被静默吞)。
+                raise RuntimeError(f"Lark: 拉 bot open_id 网络失败: {e}") from e
+            try:
+                data = r.json()
+            except Exception as e:
+                raise RuntimeError(f"Lark: 解析 bot_info 响应失败: {e}") from e
+
+            bot = (data.get("data") or {}).get("bot") or {}
             open_id = bot.get("open_id")
             if open_id:
-                self._bot_open_id = open_id
+                self._bot_open_id = open_id  # 缓存
                 logger.info("Lark bot open_id 缓存: %s", open_id)
+            else:
+                # 后端返 200 但没 open_id —— 缓存为 None(算成功,后续 _is_bot_mentioned 会走 mentioned_type 兜底)
+                self._bot_open_id = None
+                logger.warning(
+                    "Lark bot open_id 为空(code=%s msg=%s), @ 检测将回退到 mentioned_type",
+                    data.get("code"), data.get("msg"),
+                )
             return open_id
-        except Exception:
-            logger.exception("fetch bot open_id failed")
-            return None
 
     # ---------- 内部实现 ----------
 
@@ -234,7 +306,19 @@ class LarkChannel(BaseChannel):
                 self._last_msg_id[session_id] = message_id
             # CH-1:解析 mentions;若 mention 列表里有 bot 自己的 open_id 则 mentioned=True
             is_dm = (getattr(msg, "chat_type", "") == "p2p")
-            bot_open_id = getattr(self, "_bot_open_id", None) or self._fetch_bot_open_id()
+            # 启动期已在 start() 里预热过缓存,这里直接命中(sentinel != _UNSET)→ O(1) 命中。
+            # 如果运行时被旁路调用(测试 / 手动,没经过 start() 预热),再走 await。
+            # 运行时拉失败要兜底(回退到 mentioned_type)—— 不能因为 bot_open_id 拉不到
+            # 就让整条消息掉地上,phase 25 / a3 之前就是这样被静默吞的;现在显式 try 一次。
+            if self._bot_open_id is _UNSET:
+                try:
+                    bot_open_id: Optional[str] = await self._fetch_bot_open_id()
+                except RuntimeError as e:
+                    logger.warning("运行时拉 bot open_id 失败,@ 检测回退到 mentioned_type: %s", e)
+                    bot_open_id = None
+            else:
+                cached = self._bot_open_id
+                bot_open_id = None if cached is None else str(cached)
             mentioned = _is_bot_mentioned(getattr(msg, "mentions", None), bot_open_id)
             # 走统一管道(经过 AutoReply)
             await self.dispatch(IncomingMessage(
