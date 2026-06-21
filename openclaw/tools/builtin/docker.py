@@ -195,8 +195,11 @@ def register_docker_tools(
         """列出本地已有 docker 镜像。"""
         if not _HAS_DOCKER:
             return "[error] docker 未安装,运行 `pip install openclaw-py[all]` 获取 docker SDK"
-        client = docker.from_env()
         try:
+            # from_env() 本身可能抛(pywintypes.error on Windows runner without
+            # docker daemon,PermissionError on Linux 无 /var/run/docker.sock),
+            # 必须放在 try 里,否则 test_docker_tools_optional 会 fail
+            client = docker.from_env()
             images = client.images.list()
         except Exception as e:
             return f"[error] 连接 docker daemon 失败: {e}"
