@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -18,6 +19,32 @@ from openclaw.core.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _default_journal_dir() -> Path:
+    """默认 journal 目录:OPENCLAW_JOURNAL_DIR 或 ~/.openclaw/journal/。
+
+    可以通过环境变量覆盖。
+    """
+    custom = os.environ.get("OPENCLAW_JOURNAL_DIR", "").strip()
+    if custom:
+        return Path(custom).expanduser()
+    return Path.home() / ".openclaw" / "journal"
+
+
+def make_default_journal():
+    """构造一个默认 AgentJournal(无 LLM key 也能跑,TemplateReflector)。
+
+    失败返回 None(磁盘满 / 权限不足等)— 不阻断 gateway 启动。
+    """
+    try:
+        from openclaw.agent.journal import AgentJournal
+        root = _default_journal_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        return AgentJournal(root=root)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("default journal 构造失败(不影响启动): %s", e)
+        return None
+
+
 @dataclass
 class GatewayDeps:
     """Gateway 用到的全部依赖。
@@ -26,12 +53,14 @@ class GatewayDeps:
     - agent_loop: AgentLoop 实例(可能为 None,这种时候 /v1/chat 会返回 503)
     - config: OpenClawConfig(可能为 None)
     - config_path: 配置 yaml 路径(供 /v1/config 查看)
+    - journal: AgentJournal 实例(可能为 None,无 journal 时 /v1/journal/* 会 503)
     - extra: 路由可自由读写的扩展点
     """
 
     agent_loop: Optional[AgentLoop] = None
     config: Any = None
     config_path: Optional[Path] = None
+    journal: Any = None  # AgentJournal (避免循环 import 写 Any)
     started_at: float = field(default_factory=lambda: __import__("time").time())
     extra: dict[str, Any] = field(default_factory=dict)
 

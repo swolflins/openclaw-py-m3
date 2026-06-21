@@ -22,7 +22,7 @@ from openclaw.core.rate_limit import RateLimiter
 from openclaw.gateway import metrics as m
 from openclaw.gateway.deps import GatewayDeps, get_deps
 from openclaw.gateway.metrics import _normalize_path
-from openclaw.gateway.routes import channels, chat, health, memory, sessions, skills, tools
+from openclaw.gateway.routes import channels, chat, health, journal, memory, sessions, skills, tools
 
 logger = get_logger(__name__)
 
@@ -170,6 +170,7 @@ def create_app(
     app.include_router(tools.router, prefix="/v1")
     app.include_router(skills.router, prefix="/v1")
     app.include_router(channels.router, prefix="/v1")
+    app.include_router(journal.router, prefix="/v1")
 
     # 静态 Web UI(挂在 /ui)
     from fastapi.staticfiles import StaticFiles

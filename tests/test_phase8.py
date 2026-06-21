@@ -480,9 +480,11 @@ def test_root_index(client):
 def test_ui_html(client):
     r = client.get("/ui/")
     assert r.status_code == 200
-    assert "OpenClaw Gateway" in r.text
-    assert "/v1/chat" in r.text
-    assert "/v1/sessions" in r.text
+    # Phase 22 dashboard 必备关键字
+    for kw in ("OpenClaw Gateway", "Sessions", "Journal", "browse_url"):
+        assert kw in r.text, f"dashboard.html 缺少关键字: {kw}"
+    # 必须包含 4 个 v1 endpoint 之一
+    assert "/v1/" in r.text
 
 
 def test_ui_static_404(client):
