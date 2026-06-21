@@ -119,6 +119,7 @@ def create_app(
     deps: GatewayDeps | None = None,
     *,
     rate_limiter: RateLimiter | None | type(...) = ...,  # ... = use default
+    host: str | None = None,
 ) -> FastAPI:
     """工厂函数:可以注入自定义 deps(测试用)。
 
@@ -126,10 +127,24 @@ def create_app(
     - 传 ``None`` → 关掉限流(测试/本地开发)
     - 传 ``RateLimiter`` 实例 → 用这个 limiter
     - 不传 / 传 Ellipsis → 走 module-level 单例(env 控制)
+
+    ``host``(Phase 25):显式传入监听地址 — 0.0.0.0 + 无 token 视为生产部署,
+    启动期 fail-fast。默认从 ``OPENCLAW_GATEWAY_HOST`` env 读;测试可显式传。
     """
     # NEW-1:生产模式无 token → 启动期直接拒绝
     from openclaw.gateway.auth import require_token_in_production
     require_token_in_production()
+
+    # Phase 25:host=0.0.0.0 但 token 未配置 → 启动期 fail-fast
+    # 0.0.0.0 视为对外暴露(类似 production),127.0.0.1 仍允许 dev。
+    _host = host if host is not None else os.environ.get("OPENCLAW_GATEWAY_HOST", "127.0.0.1")
+    _token_raw = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
+    if _host == "0.0.0.0" and not _token_raw:
+        raise RuntimeError(
+            "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
+            "为防止未鉴权部署,启动被拒绝。请设置: "
+            "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+        )
 
     app = FastAPI(
         title="OpenClaw Gateway",
@@ -143,11 +158,12 @@ def create_app(
 
     # 中间件:顺序很重要
     # 1. 鉴权(SEC-1)— 配置 OPENCLAW_GATEWAY_TOKEN 后启用,未配置则仅 dev
-    # 2. 限流(SEC-12)— 对 /v1/chat /v1/channels/send 生效
+    # 2. 限流(SEC-12)— 对 /v1/chat / /v1/channels/send 生效
     # 3. RequestID(SEC-11)— 注入 request_id
     # 4. Metrics(SEC-12)— 收集 path/method/status,降基数
     from openclaw.gateway.auth import install_auth
-    install_auth(app)
+    # 启动期已 fail-fast,这里把 host 透传给 AuthMiddleware 做双层保险
+    install_auth(app, host=_host)
     # 限流:用户显式 None 关掉;否则走 module-level 单例
     rl = _RATE_LIMITER if rate_limiter is ... else rate_limiter
     if rl is None:

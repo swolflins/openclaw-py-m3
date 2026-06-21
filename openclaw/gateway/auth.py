@@ -102,12 +102,29 @@ def _check_token(provided: str, configured: Iterable[str]) -> bool:
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    """请求级鉴权:未通过 → 401,公共路径放行。"""
+    """请求级鉴权:未通过 → 401,公共路径放行。
 
-    def __init__(self, app, *, tokens: list[str] | None = None) -> None:
+    Phase 25:增加 ``host`` 显式参数 — 当 host="0.0.0.0" 且 tokens 为空时,
+    直接抛 RuntimeError(双层保险)。127.0.0.1 仍允许无 token(纯本地开发)。
+    """
+
+    def __init__(
+        self,
+        app,
+        *,
+        tokens: list[str] | None = None,
+        host: str | None = None,
+    ) -> None:
         super().__init__(app)
         # 允许测试时直接传(否则走 env)
         self._tokens = tokens if tokens is not None else _configured_tokens()
+        # 显式传了 host 才用,否则保持 dev 兼容(允许 0.0.0.0 + 空 token)
+        if host is not None and host == "0.0.0.0" and not self._tokens:
+            raise RuntimeError(
+                "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
+                "为防止未鉴权部署,启动被拒绝。请设置: "
+                "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+            )
         if not self._tokens:
             logger.warning(
                 "gateway_auth_disabled:OPENCLAW_GATEWAY_TOKEN 未设置,"
@@ -134,9 +151,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def install_auth(app, tokens: list[str] | None = None) -> None:
-    """把 AuthMiddleware 挂到 FastAPI app(简单工厂,测试用)。"""
-    app.add_middleware(AuthMiddleware, tokens=tokens)
+def install_auth(app, tokens: list[str] | None = None, host: str | None = None) -> None:
+    """把 AuthMiddleware 挂到 FastAPI app(简单工厂,测试用)。
+
+    Phase 25:``host`` 透传给 AuthMiddleware — 测试用 127.0.0.1 即可绕过 fail-fast。
+    """
+    app.add_middleware(AuthMiddleware, tokens=tokens, host=host)
 
 
 def require_token_or_403(provided: str | None) -> None:
