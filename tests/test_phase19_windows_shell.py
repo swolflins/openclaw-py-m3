@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from openclaw.tools.registry import ToolRegistry
+
 
 # C1 修复后,requires_approval 工具在无 approver 时 fail-closed。
 # 测试中需要一个 always-approve 的 approver。

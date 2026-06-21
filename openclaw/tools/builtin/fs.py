@@ -97,7 +97,7 @@ def register_fs_tools(
         with real.open("r", encoding="utf-8", errors="replace") as f:
             text = f.read(cap + 1)
         if len(text) > cap:
-            text = text[:cap] + f"\n... [truncated, remaining omitted]"
+            text = text[:cap] + "\n... [truncated, remaining omitted]"
         return text
 
     @registry.tool(category=ToolCategory.FS, permission=ToolPermission.WRITE)

@@ -27,6 +27,8 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
+from openclaw.tools.registry import ToolRegistry
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
