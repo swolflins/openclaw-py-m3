@@ -309,5 +309,106 @@ def test_main_callable_importable():
 def test_help_lists_all_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for cmd in ["version", "run", "serve", "gateway", "config", "models", "sessions", "plugins", "skills", "doctor", "completion"]:
+    for cmd in [
+        "version", "run", "serve", "gateway", "config", "models",
+        "sessions", "plugins", "skills", "doctor", "completion",
+        "agent", "channels", "message", "memory", "journal",
+        "tools", "security", "cron", "system", "logs", "sandbox",
+    ]:
         assert cmd in result.stdout, f"命令 {cmd} 未在 help 中列出"
+
+
+# ---------------------------------------------------------------------------
+# 第二批命令:agent / channels / message / memory / journal / tools
+#                / security / cron / system / logs / sandbox
+# ---------------------------------------------------------------------------
+
+def test_agent_no_provider():
+    """agent 命令无 provider 配置时应报配置错误。"""
+    result = runner.invoke(app, ["agent", "-m", "hi"])
+    assert result.exit_code != 0
+    assert result.exception is not None
+    assert "provider" in str(result.exception).lower() or "配置" in str(result.exception)
+
+
+def test_channels_types():
+    """channels types 不需 gateway,列出内置类型。"""
+    result = runner.invoke(app, ["--json", "channels", "types"])
+    assert result.exit_code == 0
+    assert "cli" in result.stdout
+    assert "lark" in result.stdout
+
+
+def test_channels_list_gateway_not_running():
+    result = runner.invoke(app, ["channels", "list", "--url", "http://127.0.0.1:39999"])
+    assert result.exit_code != 0
+
+
+def test_message_gateway_not_running():
+    result = runner.invoke(app, ["message", "chat", "hi", "--url", "http://127.0.0.1:39999"])
+    assert result.exit_code != 0
+
+
+def test_memory_gateway_not_running():
+    result = runner.invoke(app, ["memory", "short", "--url", "http://127.0.0.1:39999"])
+    assert result.exit_code != 0
+
+
+def test_journal_gateway_not_running():
+    result = runner.invoke(app, ["journal", "entries", "--url", "http://127.0.0.1:39999"])
+    assert result.exit_code != 0
+
+
+def test_tools_gateway_not_running():
+    result = runner.invoke(app, ["tools", "list", "--url", "http://127.0.0.1:39999"])
+    assert result.exit_code != 0
+
+
+def test_security(cfg_file: Path):
+    """security 审计应返回 findings 结构。"""
+    result = runner.invoke(app, ["--json", "-c", str(cfg_file), "security"])
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert "findings" in data
+    assert "summary" in data
+
+
+def test_security_check_tools(cfg_file: Path):
+    result = runner.invoke(app, ["--json", "-c", str(cfg_file), "security", "--check", "tools"])
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert "findings" in data
+
+
+def test_cron_list():
+    """cron list 应正常执行(可能无任务)。"""
+    result = runner.invoke(app, ["cron", "list"])
+    assert result.exit_code == 0
+
+
+def test_system():
+    """system 命令返回系统信息。"""
+    result = runner.invoke(app, ["--json", "system"])
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["openclaw_py"] == "0.1.0"
+    assert "dependencies" in data
+    assert "python" in data
+
+
+def test_logs_no_file():
+    """logs 命令在无日志文件时应提示而非崩溃。"""
+    result = runner.invoke(app, ["logs"])
+    assert result.exit_code == 0  # 提示模式,不报错
+
+
+def test_sandbox():
+    """sandbox 命令应正常执行(可能 docker 不可用)。"""
+    result = runner.invoke(app, ["sandbox"])
+    assert result.exit_code == 0
+
+
+def test_tools_call_invalid_json(cfg_file: Path):
+    """tools call 的 --args 非法 JSON 应报配置错误。"""
+    result = runner.invoke(app, ["tools", "call", "some_tool", "-a", "not-json", "--url", "http://127.0.0.1:39999"])
+    assert result.exit_code != 0

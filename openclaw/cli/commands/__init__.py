@@ -17,11 +17,22 @@ _COMMAND_MODULES = [
     "openclaw.cli.commands.config",
     "openclaw.cli.commands.models",
     "openclaw.cli.commands.run",
+    "openclaw.cli.commands.agent",
     "openclaw.cli.commands.sessions",
+    "openclaw.cli.commands.channels",
+    "openclaw.cli.commands.message",
+    "openclaw.cli.commands.memory",
+    "openclaw.cli.commands.journal",
+    "openclaw.cli.commands.tools",
     "openclaw.cli.commands.skills",
     "openclaw.cli.commands.plugins",
     "openclaw.cli.commands.gateway",
     "openclaw.cli.commands.doctor",
+    "openclaw.cli.commands.security",
+    "openclaw.cli.commands.cron",
+    "openclaw.cli.commands.system",
+    "openclaw.cli.commands.logs",
+    "openclaw.cli.commands.sandbox",
 ]
 
 
