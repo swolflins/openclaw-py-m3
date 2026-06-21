@@ -169,6 +169,7 @@ def test_pynacl_missing_production_init_raises(monkeypatch):
 
 def test_pynacl_available_valid_sig_accepts():
     """pynacl 装好 + 合法 Ed25519 sig → return True(放行 → 200)。"""
+    pytest.importorskip("nacl")  # CI ubuntu runner 没装 pynacl 优雅 skip
     import openclaw.channels.discord as dmod
 
     priv_hex, pub_hex = _gen_ed25519_keypair()
@@ -184,6 +185,7 @@ def test_pynacl_available_valid_sig_accepts():
 
 def test_pynacl_available_invalid_sig_rejects():
     """pynacl 装好 + 错误 sig → return False(拒 → 400)。"""
+    pytest.importorskip("nacl")  # CI ubuntu runner 没装 pynacl 优雅 skip
     import openclaw.channels.discord as dmod
 
     _, pub_hex = _gen_ed25519_keypair()
@@ -256,6 +258,7 @@ def test_prod_mode_with_pynacl_present_does_not_raise():
 
     防止误伤:正常生产部署应该能起来。
     """
+    pytest.importorskip("nacl")  # CI ubuntu runner 没装 pynacl 优雅 skip
     import openclaw.channels.discord as dmod
 
     os.environ["OPENCLAW_ENV"] = "production"
