@@ -104,6 +104,15 @@ LARK_MEDIA_CACHE_TTL_SECONDS = 7 * 24 * 3600     # 7 天过期
 # 入站媒体文件类型(基于 message_type 字段)
 LARK_MEDIA_TYPES = {"image", "file", "audio", "media", "video"}
 
+# Phase 33:支持的出站消息类型
+# 参考 Hermes Feishu 4499 处的 msg_type 取值;text / post / interactive
+# 是最常用的三档;image / file / share_chat 在出库路径里也需要 base64 + 资源上传,
+# 本 Phase 不实现完整 image/file 发送(改由 send_typed("image", {"image_key": "..."}) 提供)
+_SUPPORTED_OUTBOUND_MSG_TYPES = {"text", "post", "interactive", "image", "file", "share_chat"}
+
+# Phase 33:最大 message 内容长度(超长截断,防飞书 400)
+LARK_MAX_MESSAGE_LENGTH = 30_000
+
 
 def _is_bot_mentioned(mentions: Optional[list], bot_open_id: Optional[str]) -> bool:
     """CH-1:判断飞书事件里是否 @ 了 bot。
@@ -167,6 +176,37 @@ def _group_policy() -> str:
         logger.warning("LARK_GROUP_POLICY=%r 不识别,回退到 open", p)
         return "open"
     return p
+
+
+def _truncate_text(text: str, max_len: int) -> str:
+    """Phase 33:超长文本截断 + 后缀,避免飞书 400。"""
+    if len(text) <= max_len:
+        return text
+    # 极端情况 max_len 极小时,截断 suffix 自身
+    if max_len <= 5:
+        return text[:max_len]
+    suffix = "...(truncated)"
+    keep = max(0, max_len - len(suffix))
+    return text[:keep] + suffix
+
+
+def _resolve_receive_id(chat_id: str) -> tuple[str, str]:
+    """Phase 33:从 session 中的 chat_id 解析 ``(receive_id, receive_id_type)``。
+
+    规则(参考 Hermes 4491-4495):
+    - ``feishu_user_id:`` 前缀 → ``(user_id, "user_id")``(走 user_id_type)
+    - ``ou_`` 前缀 → ``(open_id, "open_id")``
+    - 其他 → ``(chat_id, "chat_id")``(默认群)
+
+    注:union_id / email 类型为 1.0 后续,这里先覆盖最常用的三种。
+    """
+    if not chat_id:
+        return ("", "chat_id")
+    if chat_id.startswith("feishu_user_id:"):
+        return (chat_id[len("feishu_user_id:"):], "user_id")
+    if chat_id.startswith("ou_"):
+        return (chat_id, "open_id")
+    return (chat_id, "chat_id")
 
 
 # ─────────────────────── Webhook 异常追踪器(静态/共享) ───────────────────────
@@ -430,7 +470,10 @@ class LarkChannel(BaseChannel):
                 self._task.cancel()
 
     async def send(self, session_id: str, text: str) -> None:
-        """主动给 session_id 发送消息(默认 reply 原消息)。"""
+        """主动给 session_id 发送消息(默认 reply 原消息)。
+
+        向后兼容的 plain-text 接口。富文本 / 卡片走 ``send_typed``。
+        """
         if not self.available:
             logger.warning("Lark 未配置,无法发送消息")
             return
@@ -444,6 +487,42 @@ class LarkChannel(BaseChannel):
             )
             return
         await self._reply_to_lark(message_id, text)
+
+    # ---------- Phase 33: 通用发送(支持 post / interactive) ----------
+
+    async def send_typed(
+        self,
+        session_id: str,
+        msg_type: str,
+        content: Any,
+        *,
+        reply_to: Optional[str] = None,
+    ) -> bool:
+        """Phase 33:通用发送,支持 text / post / interactive 等消息类型。
+
+        - ``session_id``:与 dispatch 进来的格式一致 (lark:<chat_id>:<open_id>)
+        - ``msg_type``:飞书消息类型(text / post / interactive / image / file ...)
+        - ``content``:已序列化的内容(text: dict;text 字段;post: 二维 list;interactive: dict)
+        - ``reply_to``:指定要 reply 的 message_id;不传则 create new message
+          (由 ``_resolve_receive_id`` 决定 receive_id + receive_id_type)
+        - 返回 True/False 表示成功;**不抛**(业务可能只关心是否送达)
+        """
+        if not self.available:
+            logger.warning("Lark 未配置,send_typed 失败")
+            return False
+        if msg_type not in _SUPPORTED_OUTBOUND_MSG_TYPES:
+            logger.error("Lark send_typed 不支持的 msg_type=%s", msg_type)
+            return False
+        # content 统一成字符串(JSON)
+        if isinstance(content, str):
+            content_str = content
+        else:
+            try:
+                content_str = json.dumps(content, ensure_ascii=False)
+            except (TypeError, ValueError):
+                logger.exception("Lark send_typed content 序列化失败")
+                return False
+        return await self._send_typed(session_id, msg_type, content_str, reply_to=reply_to)
 
     # ---------- Phase 31 公共钩子(供子类 / 测试 / 外部 handler 复用) ----------
 
@@ -1459,11 +1538,15 @@ class LarkChannel(BaseChannel):
         return ""
 
     async def _reply_to_lark(self, message_id: str, text: str) -> None:
-        """回复一条飞书消息(用 im/v1/messages/:id/reply)。"""
+        """回复一条飞书消息(用 im/v1/messages/:id/reply)。
+
+        Phase 33:内容超 ``LARK_MAX_MESSAGE_LENGTH`` 时截断,避免飞书 400。
+        """
         import httpx
 
         if not text:
             return
+        text = _truncate_text(text, LARK_MAX_MESSAGE_LENGTH)
 
         token = await self._get_tenant_token()
         if not token:
@@ -1518,3 +1601,160 @@ class LarkChannel(BaseChannel):
         except Exception:
             logger.exception("获取 tenant_access_token 失败")
             return None
+
+    # ---------- Phase 33: 通用 send_typed / _post_message / builders ----------
+
+    async def _send_typed(
+        self,
+        session_id: str,
+        msg_type: str,
+        content_str: str,
+        *,
+        reply_to: Optional[str] = None,
+    ) -> bool:
+        """Phase 33:内部 send_typed 真正发出去。返回 True/False,失败仅 logger.error。"""
+        import httpx
+
+        token = await self._get_tenant_token()
+        if not token:
+            logger.error("Lark send_typed:拿不到 tenant_access_token")
+            return False
+
+        # 从 session_id 解析 chat_id:形如 lark:<chat_id>:<open_id>
+        # chat_id 可能含 ":"(如 feishu_user_id:u_abc),所以应取 last-1 而不是 parts[1]。
+        # 形如: lark / <chat_id 全段> / <open_id>
+        parts = session_id.split(":")
+        if len(parts) >= 3:
+            # 拼接中间所有段为 chat_id
+            chat_id = ":".join(parts[1:-1])
+        elif len(parts) == 2:
+            chat_id = parts[1]
+        else:
+            chat_id = ""
+        receive_id, receive_id_type = _resolve_receive_id(chat_id)
+
+        if reply_to:
+            # 走 reply API
+            url = f"https://open.feishu.cn/open-apis/im/v1/messages/{reply_to}/reply"
+            body = {"msg_type": msg_type, "content": content_str}
+        else:
+            # 走 create message API
+            if not receive_id:
+                logger.error(
+                    "Lark send_typed:session_id 解析不到 receive_id session=%s",
+                    session_id,
+                )
+                return False
+            url = "https://open.feishu.cn/open-apis/im/v1/messages"
+            body = {
+                "msg_type": msg_type,
+                "content": content_str,
+                "receive_id": receive_id,
+            }
+            # 通过 query string 传 receive_id_type(reply API 不需要)
+            url = f"{url}?receive_id_type={receive_id_type}"
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(url, json=body, headers=headers)
+                ctype = getattr(r, "headers", {}).get("content-type", "")
+                data: dict[str, Any] = {}
+                if ctype.startswith("application/json"):
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = {}
+                if r.status_code != 200 or data.get("code", 0) != 0:
+                    logger.error(
+                        "Lark send_typed 失败 http=%s code=%s msg=%s body=%s",
+                        r.status_code, data.get("code"), data.get("msg"), data,
+                    )
+                    return False
+                logger.info(
+                    "Lark send_typed 成功 session=%s msg_type=%s",
+                    session_id, msg_type,
+                )
+                return True
+        except Exception:
+            logger.exception("Lark send_typed 异常")
+            return False
+
+    async def _post_message(
+        self,
+        receive_id: str,
+        receive_id_type: str,
+        msg_type: str,
+        content_str: str,
+    ) -> bool:
+        """Phase 33:直接发到指定 receive_id 的低层入口。
+
+        不基于 session_id 解析;由调用方(比如 send_typed / 测试)自己提供。
+        """
+        return await self._send_typed(
+            f"lark:{receive_id}:manual",
+            msg_type,
+            content_str,
+        )
+
+    # ---------- Phase 33: 出站消息 builder helpers ----------
+
+    @staticmethod
+    def build_text_payload(text: str) -> dict[str, str]:
+        """Phase 33:text 类型 payload 助手(对齐 ``msg_type=text`` 约定)。"""
+        return {"text": text}
+
+    @staticmethod
+    def build_post_payload(
+        lines: list[list[dict[str, Any]]],
+        *,
+        title: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Phase 33:post 类型 payload builder。
+
+        ``lines`` 是 ``[[{"tag": "text", "text": "..."}], ...]`` 二维结构;
+        ``title`` 是可选的标题(空字符串也行,飞书会渲染在最上方)。
+        """
+        payload: dict[str, Any] = {"content": lines}
+        if title:
+            payload["title"] = title
+        return payload
+
+    @staticmethod
+    def build_at_post_payload(
+        open_ids: list[str],
+        text: str = "",
+        *,
+        title: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Phase 33:@ 多人 + 文本的 post 助手(常见\"@张三 @李四 看看\"用法)。"""
+        line: list[dict[str, Any]] = [
+            {"tag": "at", "user_id": oid} for oid in open_ids if oid
+        ]
+        if text:
+            line.append({"tag": "text", "text": text})
+        return LarkChannel.build_post_payload([line], title=title)
+
+    @staticmethod
+    def build_interactive_card_payload(
+        *,
+        elements: list[dict[str, Any]],
+        header: Optional[dict[str, Any]] = None,
+        config: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Phase 33:interactive (卡片) 消息 payload builder。
+
+        ``elements`` 是 div / action 等节点列表;
+        ``header`` 是可选的标题 / 颜色(``{"title": "...", "template": "blue"}``);
+        ``config`` 是 ``{"wide_screen_mode": true, ...}`` 类选项。
+        """
+        payload: dict[str, Any] = {"elements": elements}
+        if header is not None:
+            payload["header"] = header
+        if config is not None:
+            payload["config"] = config
+        return payload
