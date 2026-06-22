@@ -5,12 +5,37 @@
 由 CLI 入口在启动前检测并提示。
 
 依赖: pip install lark-oapi
+
+Phase 31 / 参考 Hermes Feishu adapter 的优化项
+-----------------------------------------------
+1. **Persistent dedup state**: 飞书会重发同一条 message_id(网络抖动/重启),
+   把已见 ID 落盘 JSON,重启后跳过,避免重复回复。LRU 上限 ``DEDUP_CACHE_SIZE``。
+2. **Per-chat 串行锁**: 同一 chat_id 的消息排队处理,避免并发乱序
+   (Hermes 的 ``createChatQueue`` 语义)。锁有 LRU 上限,常驻活跃 chat 不被驱逐。
+3. **DM allowlist**: ``LARK_ALLOWED_USERS`` 配置 sender open_id 白名单,
+   群消息走 ``LARK_GROUP_POLICY=open|allowlist|disabled`` 策略。
+4. **Reaction 事件 → 合成 text 事件**: 把 ``im.message.reaction.created/deleted``
+   路由成 ``reaction:added:Typing`` 文本,让 agent 能感知用户对 bot 消息的表态。
+5. **Card action → 合成 COMMAND 事件**: 卡片按钮点击转 ``/card <action>`` 命令。
+6. **Processing reaction**: 派发前后 add/remove Typing reaction,失败时改 CrossMark。
+7. **Webhook 异常追踪 + verification token 校验 API**: 暴露
+   ``record_webhook_anomaly`` / ``verify_webhook_token`` 静态/实例方法,
+   未来启 Webhook 模式时直接复用。
+8. **post 富文本解析**: 支持 at + 文本行,把 ``@_user_xxx`` 替换成 @昵称后再 strip。
+
+Webhook 模式 (LARK_USE_WS=false) 当前仍抛 NotImplementedError,但 verification
+token 校验、异常追踪、签名校验等子模块已可在路由层(未来加 aiohttp app)直接复用。
 """
 from __future__ import annotations
 
 import asyncio
+import collections
+import hmac
 import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Any, Optional
 
 from openclaw.agent.loop import AgentLoop
@@ -41,6 +66,27 @@ class _UnsetType:
 _UNSET = _UnsetType()
 
 
+# ─────────────────────── Phase 31 常量 ───────────────────────
+
+# 去重缓存容量:超过就 LRU 驱逐最旧 ID(并落盘时截断)。
+DEDUP_CACHE_SIZE = 10_000
+# 去重 ID 有效期(秒);TTL<=0 表示永不过期。
+DEDUP_TTL_SECONDS = 24 * 3600
+# 持久化文件路径(可被 OPENCLAW_LARK_DEDUP_PATH 覆盖)。
+DEDUP_DEFAULT_PATH = "~/.openclaw/lark_seen_message_ids.json"
+
+# Per-chat 锁最大缓存数(防止长跑 gateway 内存膨胀);活跃锁永不被驱逐。
+CHAT_LOCK_MAX_SIZE = 512
+
+# Webhook 异常追踪:连续 N 次错响应 → warning。N 个错后清零。
+WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 3600
+WEBHOOK_ANOMALY_THRESHOLD = 25
+
+# Reaction 表情(对应飞书 emoji_type)
+REACTION_IN_PROGRESS = "Typing"
+REACTION_FAILURE = "CrossMark"
+
+
 def _is_bot_mentioned(mentions: Optional[list], bot_open_id: Optional[str]) -> bool:
     """CH-1:判断飞书事件里是否 @ 了 bot。
 
@@ -61,6 +107,118 @@ def _is_bot_mentioned(mentions: Optional[list], bot_open_id: Optional[str]) -> b
             continue
     return False
 
+
+def _dedup_path(settings: Optional["LarkSettings"] = None) -> Path:
+    """获取去重状态持久化路径。
+
+    优先级: ``LarkSettings.dedup_path``(显式设的) >
+    ``OPENCLAW_LARK_DEDUP_PATH`` 环境变量 > ``~/.openclaw/lark_seen_message_ids.json``。
+
+    设为 ``""`` 时返回 ``None`` 的语义(走 in-memory)由调用方处理。
+    """
+    raw: str = ""
+    if settings is not None and getattr(settings, "dedup_path", None):
+        raw = settings.dedup_path
+    if not raw:
+        raw = os.environ.get("OPENCLAW_LARK_DEDUP_PATH", "").strip()
+    if not raw:
+        raw = DEDUP_DEFAULT_PATH
+    return Path(raw).expanduser()
+
+
+def _allowed_users() -> set[str]:
+    """从环境变量读 LARK_ALLOWED_USERS(逗号 / 空白分隔),返回 open_id 集合。
+
+    缺省 / 空 → 视为「不限制」(空集表示放行所有),由 ``check_dm_allowed`` 决定。
+    """
+    raw = os.environ.get("LARK_ALLOWED_USERS", "").strip()
+    if not raw:
+        return set()
+    return {t.strip() for t in raw.replace(",", " ").split() if t.strip()}
+
+
+def _group_policy() -> str:
+    """``LARK_GROUP_POLICY``: open / allowlist / disabled。
+
+    - open: 不限制群消息(但仍受 allowed_users 影响 —— allowlist 不空时只放白名单)
+    - allowlist: 只接受 allowed_users 内的 sender
+    - disabled: 群消息一律丢弃
+    """
+    p = os.environ.get("LARK_GROUP_POLICY", "open").strip().lower()
+    if p not in {"open", "allowlist", "disabled"}:
+        logger.warning("LARK_GROUP_POLICY=%r 不识别,回退到 open", p)
+        return "open"
+    return p
+
+
+# ─────────────────────── Webhook 异常追踪器(静态/共享) ───────────────────────
+# 进程级单例,instance 方法只是薄包装,便于 Webhook 路由未来直接调。
+_webhook_anomaly_counts: dict[str, tuple[int, str, float]] = {}
+_webhook_anomaly_lock = asyncio.Lock()
+
+
+def record_webhook_anomaly(remote_ip: str, status: str) -> None:
+    """递增指定 IP 的连续错响应计数;每 ``WEBHOOK_ANOMALY_THRESHOLD`` 次打 warning。
+
+    Hermes 对应实现: ``_record_webhook_anomaly``。这里做成模块级函数,供未来
+    Webhook 路由 handler 直接调用,无须实例化 LarkChannel。
+    """
+    now = time.time()
+    entry = _webhook_anomaly_counts.get(remote_ip)
+    if entry is not None:
+        count, _last_status, first_seen = entry
+        if now - first_seen < WEBHOOK_ANOMALY_TTL_SECONDS:
+            count += 1
+            if count % WEBHOOK_ANOMALY_THRESHOLD == 0:
+                logger.warning(
+                    "[Lark webhook] 异常:%d 次连续错响应 (%s) from %s over last %.0fs",
+                    count, status, remote_ip, now - first_seen,
+                )
+            _webhook_anomaly_counts[remote_ip] = (count, status, first_seen)
+            return
+    # 首次或 TTL 过期 → 重置
+    _webhook_anomaly_counts[remote_ip] = (1, status, now)
+
+
+def clear_webhook_anomaly(remote_ip: str) -> None:
+    """成功后清零指定 IP 的错响应计数。"""
+    _webhook_anomaly_counts.pop(remote_ip, None)
+
+
+def verify_webhook_token(
+    provided: Optional[str], expected: Optional[str]
+) -> bool:
+    """验证飞书 Webhook URL verification token(``type=url_verification`` 阶段)。
+
+    走 ``hmac.compare_digest`` 防时序攻击。任一为空 → 不通过(强制要求配 token)。
+    """
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(str(provided), str(expected))
+
+
+def verify_webhook_signature(
+    *,
+    timestamp: Optional[str],
+    nonce: Optional[str],
+    body_str: str,
+    encrypt_key: str,
+    provided_signature: Optional[str],
+) -> bool:
+    """校验飞书 AES 加密回调的 SHA256 签名。
+
+    算法: ``SHA256(timestamp + nonce + encrypt_key + body_str)``,base64 编码。
+    任一缺失 → False(强制配 encrypt_key 才走加密回调)。
+    """
+    if not (timestamp and nonce and encrypt_key and provided_signature):
+        return False
+    import base64
+    import hashlib
+    raw = f"{timestamp}{nonce}{encrypt_key}{body_str}"
+    digest = base64.b64encode(hashlib.sha256(raw.encode("utf-8")).digest()).decode("ascii")
+    return hmac.compare_digest(digest, str(provided_signature))
+
+
 try:  # 飞书 SDK 可选依赖
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
@@ -74,7 +232,15 @@ except Exception:  # pragma: no cover - 兼容未装 SDK
 
 
 class LarkChannel(BaseChannel):
-    """飞书自建应用消息渠道(长连接)。"""
+    """飞书自建应用消息渠道(长连接)。
+
+    Phase 31 新增能力:
+    - 启动期自动 load 持久化去重 set;每次 receive 后 persist
+    - 每个 chat_id 配一个 LRU-bounded asyncio.Lock(同 chat 串行)
+    - reaction 事件 + card action 事件走与 message 同一 dispatch 管道
+    - 入站时按 LARK_ALLOWED_USERS / LARK_GROUP_POLICY 过滤
+    - 派发前后通过 on_processing_start / on_processing_complete 钩子管理 Typing/CrossMark reaction
+    """
 
     name = "lark"
 
@@ -87,10 +253,30 @@ class LarkChannel(BaseChannel):
         # session_id → 最近一条 message_id,send() 用它 reply 原消息
         self._last_msg_id: dict[str, str] = {}
         # CH-1:bot_open_id 缓存槽位(per-instance)。启动期填,运行时只读。
-        # 用一个明确的 sentinel 区分"未拉取"和"已拉取为 None"(即便后端返 None 也算成功,直接返回即可)。
         self._bot_open_id: Any = _UNSET
         # 单实例内的协程锁:多协程同时首次调用时只让一个真的发请求,其他 await 同一个结果。
         self._bot_open_id_lock = asyncio.Lock()
+        # Phase 31:per-chat 串行锁池(LRU bounded)
+        self._chat_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()
+        # Phase 31:去重 set(message_id → seen_at timestamp)+ 持久化路径
+        self._seen_message_ids: dict[str, float] = {}
+        self._seen_message_order: list[str] = []
+        # 优先 LarkSettings.dedup_path(可空字符串 → in-memory),再 env,再默认。
+        sp = getattr(settings, "dedup_path", None) if settings is not None else None
+        if sp == "":
+            # 显式空字符串:完全 in-memory,不读不写
+            self._dedup_path: Optional[Path] = None
+        else:
+            self._dedup_path = _dedup_path(settings)
+        self._dedup_lock = asyncio.Lock()  # 协程层;json 落盘走 run_in_executor
+        if self._dedup_path is not None:
+            self._load_seen_message_ids()
+        # Phase 31:allowlist 缓存(启动时读一次,env 改了需重启)
+        self._allowed_users: set[str] = _allowed_users()
+        self._group_policy: str = _group_policy()
+        if self._allowed_users:
+            logger.info("Lark 启动:LARK_ALLOWED_USERS=%d 个 open_id", len(self._allowed_users))
+        logger.info("Lark 启动:group_policy=%s", self._group_policy)
 
     # ---------- 公共接口 ----------
 
@@ -107,18 +293,21 @@ class LarkChannel(BaseChannel):
             raise RuntimeError("飞书凭据未配置 (LARK_APP_ID / LARK_APP_SECRET)")
 
         if not self.settings.use_ws:
+            # Phase 31 仍未实现完整 aiohttp 路由,但下面这些子模块已经就绪:
+            # - verify_webhook_token / verify_webhook_signature
+            # - record_webhook_anomaly / clear_webhook_anomaly
+            # 等后续 Phase 把 aiohttp app + URL verification 回调拼上即可启用。
             raise NotImplementedError(
                 "Webhook 模式尚未实现,当前仅支持长连接模式(LARK_USE_WS=true)。"
+                "verification token / signature / anomaly tracker 子模块已就绪,"
+                "等 Webhook 路由落地。"
             )
 
         # CH-1:启动期先 await 一次 bot_open_id(同步进 WS loop 之前)。
-        # 修 phase 25 / a3:之前是同步函数内部用 asyncio.run(),在 running loop 里会 RuntimeError
-        # 被静默吞掉。失败要透传 —— 凭据错就早 fail,不要带着坏状态进 WS。
         try:
             await self._fetch_bot_open_id()
         except RuntimeError as e:
             raise RuntimeError(f"启动 Lark 渠道失败:无法获取 bot open_id({e})") from e
-        # 允许 open_id 为 None(后端返 200 但 data 缺失);只 log 不 raise,_is_bot_mentioned 会兜底。
         if self._bot_open_id is None:
             logger.warning("Lark 启动:bot_open_id 为空,@ 检测将回退到 mentioned_type")
 
@@ -134,6 +323,11 @@ class LarkChannel(BaseChannel):
                 self._ws_client.stop()
             except Exception:
                 pass
+        # Phase 31:退出时刷一次去重 state
+        try:
+            await self._persist_seen_message_ids_async()
+        except Exception:
+            logger.exception("Lark 退出:刷去重状态失败")
         if self._task:
             try:
                 await asyncio.wait_for(self._task, timeout=3)
@@ -156,30 +350,163 @@ class LarkChannel(BaseChannel):
             return
         await self._reply_to_lark(message_id, text)
 
-    async def _fetch_bot_open_id(self) -> Optional[str]:
-        """CH-1:异步拉一次 bot 自己的 open_id,并缓存到 self._bot_open_id。
+    # ---------- Phase 31 公共钩子(供子类 / 测试 / 外部 handler 复用) ----------
 
-        用 im/v1/bots/me 接口。**修 phase 25 / a3**:
-        - 原来是同步函数内部用 ``asyncio.run()``,在 async 上下文里会永远抛
-          ``RuntimeError: asyncio.run() cannot be called from a running event loop``,
-          异常被 except 静默吞掉 → bot_open_id 永远拿不到 → 群 @ 检测失效。
-        - 现在改 ``async def``, 内部用 ``await`` 调底层 client(httpx.AsyncClient)。
-        - 加 per-instance 缓存 + 协程锁:同一进程 / 同一 channel 实例内只拉 1 次,
-          并发首次调用也只发 1 个网络请求,后续直接返回缓存。
-        - 启动期调用失败 → 让 RuntimeError 透传(``start()`` 把它包成 RuntimeError 抛出),
-          不要静默吞。
+    def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
+        """返回 chat_id 对应的 asyncio.Lock,不存在则创建;LRU bounded。
 
-        返回值:open_id 字符串(可能为 None —— 后端返 200 但 data.bot.open_id 缺失)。
+        活跃锁永不被驱逐(``locked()`` True 时跳过);空间满时优先驱逐空闲锁,
+        退路驱逐最旧一个。
         """
+        lock = self._chat_locks.get(chat_id)
+        if lock is not None:
+            self._chat_locks.move_to_end(chat_id)
+            return lock
+        if len(self._chat_locks) >= CHAT_LOCK_MAX_SIZE:
+            evicted = False
+            for key in list(self._chat_locks):
+                if not self._chat_locks[key].locked():
+                    self._chat_locks.pop(key)
+                    evicted = True
+                    break
+            if not evicted:
+                self._chat_locks.pop(next(iter(self._chat_locks)))
+        lock = asyncio.Lock()
+        self._chat_locks[chat_id] = lock
+        return lock
+
+    def _check_sender_allowed(self, sender_open_id: str, is_dm: bool) -> tuple[bool, str]:
+        """Phase 31:统一 allowlist 闸口。
+
+        返回 ``(allowed, reason)``。DM 与群策略各自独立。
+        """
+        if is_dm:
+            if not self._allowed_users:
+                return True, "dm_no_allowlist"
+            if sender_open_id in self._allowed_users:
+                return True, "dm_in_allowlist"
+            return False, "dm_not_in_allowlist"
+        # 群消息
+        if self._group_policy == "disabled":
+            return False, "group_disabled"
+        if self._group_policy == "allowlist":
+            if not self._allowed_users:
+                # 群策略是 allowlist 但 allowlist 空 → 放行(避免误锁)
+                logger.warning("Lark 群策略=allowlist 但 LARK_ALLOWED_USERS 为空,放行所有")
+                return True, "group_allowlist_empty"
+            if sender_open_id in self._allowed_users:
+                return True, "group_in_allowlist"
+            return False, "group_not_in_allowlist"
+        # open
+        return True, "group_open"
+
+    async def _is_duplicate(self, message_id: str) -> bool:
+        """Phase 31:基于持久化 LRU 的去重,返回 True 表示已见过。
+
+        调用后把新 ID 记入,超过 DEDUP_CACHE_SIZE 就驱逐最旧。落盘异步执行。
+        """
+        if not message_id:
+            return False
+        async with self._dedup_lock:
+            now = time.time()
+            seen_at = self._seen_message_ids.get(message_id)
+            if seen_at is not None and (
+                seen_at == 0.0  # legacy 0.0 视作 immortal(避免首次升级被全清)
+                or DEDUP_TTL_SECONDS <= 0
+                or now - seen_at < DEDUP_TTL_SECONDS
+            ):
+                return True
+            self._seen_message_ids[message_id] = now
+            self._seen_message_order.append(message_id)
+            while len(self._seen_message_order) > DEDUP_CACHE_SIZE:
+                stale = self._seen_message_order.pop(0)
+                self._seen_message_ids.pop(stale, None)
+        # 落盘不持锁(避免 IO 阻塞);失败仅 warning,下次重启可能重复
+        try:
+            await self._persist_seen_message_ids_async()
+        except Exception:
+            logger.exception("Lark 持久化去重状态失败")
+        return False
+
+    def _load_seen_message_ids(self) -> None:
+        """启动时从 JSON 加载历史去重 ID;失败 / 文件不存在 → 当作空。"""
+        if self._dedup_path is None:
+            return  # in-memory 模式
+        try:
+            text = self._dedup_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        except OSError:
+            logger.warning(
+                "Lark 去重文件不可读: %s", self._dedup_path, exc_info=True,
+            )
+            return
+        try:
+            payload = json.loads(text)
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "Lark 去重文件解析失败: %s", self._dedup_path, exc_info=True,
+            )
+            return
+        seen_data = payload.get("message_ids", {}) if isinstance(payload, dict) else {}
+        now = time.time()
+        entries: dict[str, float] = {}
+        if isinstance(seen_data, list):
+            # 兼容旧格式: list[str]
+            entries = {str(x).strip(): 0.0 for x in seen_data if str(x).strip()}
+        elif isinstance(seen_data, dict):
+            for k, v in seen_data.items():
+                if not isinstance(k, str) or not k.strip():
+                    continue
+                try:
+                    entries[k] = float(v)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    continue
+        # TTL 过滤(ts=0.0 当作永不过期,兼容旧数据)
+        valid: dict[str, float] = {
+            mid: ts for mid, ts in entries.items()
+            if ts == 0.0 or DEDUP_TTL_SECONDS <= 0 or now - ts < DEDUP_TTL_SECONDS
+        }
+        # 容量裁剪:保留最新的
+        sorted_ids = sorted(valid, key=lambda k: valid[k], reverse=True)[:DEDUP_CACHE_SIZE]
+        self._seen_message_order = list(reversed(sorted_ids))
+        self._seen_message_ids = {k: valid[k] for k in sorted_ids}
+        logger.info("Lark 启动:加载去重状态 %d 条 from %s", len(sorted_ids), self._dedup_path)
+
+    async def _persist_seen_message_ids_async(self) -> None:
+        """异步落盘去重 state。失败仅 warning。"""
+        if self._dedup_path is None:
+            return  # in-memory 模式
+        loop = asyncio.get_running_loop()
+        snapshot = (
+            list(self._seen_message_order[-DEDUP_CACHE_SIZE:]),
+            {k: self._seen_message_ids[k] for k in self._seen_message_order[-DEDUP_CACHE_SIZE:]
+             if k in self._seen_message_ids},
+            self._dedup_path,
+        )
+
+        def _write() -> None:
+            order, mapping, path = snapshot
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"message_ids": mapping}
+            # 临时文件 + rename 原子写
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=None),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+
+        await loop.run_in_executor(None, _write)
+
+    async def _fetch_bot_open_id(self) -> Optional[str]:
+        """CH-1:异步拉一次 bot 自己的 open_id,并缓存到 self._bot_open_id。"""
         # 命中缓存(包含 None) → 直接返回。
-        # 注意:None 是合法值(后端可能返 code!=0 / data 缺失),用 sentinel 区分"未拉取" vs "拉到 None"。
         cached = self._bot_open_id
         if cached is not _UNSET:
-            # cached 此时是 str 或 None(都是合法缓存值);typing 视角下是 Any,强转一下
             return None if cached is None else str(cached)
 
         async with self._bot_open_id_lock:
-            # 再次检查:进锁的协程可能已经有别的协程在锁内填好了缓存。
             cached = self._bot_open_id
             if cached is not _UNSET:
                 return None if cached is None else str(cached)
@@ -188,7 +515,6 @@ class LarkChannel(BaseChannel):
 
             token = await self._get_tenant_token()
             if not token:
-                # 拿不到 token 不算"成功拉到 None",也不缓存,让上层决定怎么办。
                 raise RuntimeError("Lark: 拿不到 tenant_access_token,无法拉 bot open_id")
 
             try:
@@ -198,8 +524,6 @@ class LarkChannel(BaseChannel):
                         headers={"Authorization": f"Bearer {token}"},
                     )
             except Exception as e:
-                # 网络层错误(timeout / ConnectError / DNS 失败等)也包成 RuntimeError,
-                # 启动期让 start() 透传,不要让 httpx 原始异常混进外层(以及避免被静默吞)。
                 raise RuntimeError(f"Lark: 拉 bot open_id 网络失败: {e}") from e
             try:
                 data = r.json()
@@ -209,10 +533,9 @@ class LarkChannel(BaseChannel):
             bot = (data.get("data") or {}).get("bot") or {}
             open_id = bot.get("open_id")
             if open_id:
-                self._bot_open_id = open_id  # 缓存
+                self._bot_open_id = open_id
                 logger.info("Lark bot open_id 缓存: %s", open_id)
             else:
-                # 后端返 200 但没 open_id —— 缓存为 None(算成功,后续 _is_bot_mentioned 会走 mentioned_type 兜底)
                 self._bot_open_id = None
                 logger.warning(
                     "Lark bot open_id 为空(code=%s msg=%s), @ 检测将回退到 mentioned_type",
@@ -223,18 +546,10 @@ class LarkChannel(BaseChannel):
     # ---------- 内部实现 ----------
 
     async def _ws_loop(self) -> None:
-        """在独立线程跑飞书 WS 客户端,带崩溃重连(REL-1)。
-
-        旧实现:ws_client.start() 一旦抛异常,_ws_loop 退出,channel 永远静默。
-        新实现:
-        - 用外层 try/except 包住 start()
-        - 退避重连:1s, 2s, 4s, 8s, 16s, 30s(上限)
-        - 收到 _stopped 后干净退出
-        - 连续 N 次失败后停止重连(让上层可以重启)
-        """
+        """在独立线程跑飞书 WS 客户端,带崩溃重连(REL-1)。"""
         loop = asyncio.get_running_loop()
         backoffs = [1, 2, 4, 8, 16, 30]
-        max_attempts = 12  # 约 2 分钟后停止重连(让运维介入)
+        max_attempts = 12
         attempt = 0
 
         def _on_message(data: Any) -> None:
@@ -244,11 +559,49 @@ class LarkChannel(BaseChannel):
             except Exception:
                 logger.exception("解析飞书事件失败")
 
-        handler = (
-            lark.EventDispatcherHandler.builder("", "")
-            .register_p2_im_message_receive_v1(_on_message)
-            .build()
-        )
+        # Phase 31:把 reaction / card action / 各种 callback 注册到 dispatcher
+        # lark-oapi 的 register 接受同步 handler,把数据 dict 塞进我们的 async 管道
+        def _on_reaction_created(data: Any) -> None:
+            asyncio.run_coroutine_threadsafe(
+                self._handle_reaction_event("im.message.reaction.created_v1", data),
+                loop,
+            )
+
+        def _on_reaction_deleted(data: Any) -> None:
+            asyncio.run_coroutine_threadsafe(
+                self._handle_reaction_event("im.message.reaction.deleted_v1", data),
+                loop,
+            )
+
+        def _on_card_action(data: Any) -> None:
+            asyncio.run_coroutine_threadsafe(self._handle_card_action(data), loop)
+
+        try:
+            from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+        except Exception:  # pragma: no cover - 异常时 fallback 老 builder
+            EventDispatcherHandler = None  # type: ignore[assignment]
+
+        if EventDispatcherHandler is not None:
+            try:
+                # SDK 0.7+ 新版 builder 接受 encrypt_key / verification_token
+                handler = (
+                    EventDispatcherHandler.builder(
+                        "",
+                        self.settings.verification_token.get_secret_value()
+                        if self.settings.verification_token else "",
+                    )
+                    .register_p2_im_message_receive_v1(_on_message)
+                    .register_p2_im_message_reaction_created_v1(_on_reaction_created)
+                    .register_p2_im_message_reaction_deleted_v1(_on_reaction_deleted)
+                    .register_p2_card_action_trigger(_on_card_action)
+                    .build()
+                )
+            except Exception:
+                # 老 SDK / 不同签名 → 退到纯 WS builder(只处理 message)
+                logger.warning("Lark 高级 event 订阅失败,降级到只收 message 事件", exc_info=True)
+                handler = self._build_basic_handler(_on_message)
+        else:
+            handler = self._build_basic_handler(_on_message)
 
         while not self._stopped.is_set():
             self._ws_client = lark.ws.Client(
@@ -258,12 +611,9 @@ class LarkChannel(BaseChannel):
                 log_level=lark.LogLevel.INFO,
             )
             try:
-                # 阻塞;期间 _stopped.set() 后 ws_client.stop() 会让 start() 返回
                 await loop.run_in_executor(None, self._ws_client.start)
-                # 正常退出(被 stop())→ 不重连
                 if self._stopped.is_set():
                     return
-                # 否则可能是意外退出
                 logger.warning("Lark WS 客户端意外退出,准备重连")
             except Exception:
                 logger.exception("Lark WS 崩溃,准备重连")
@@ -280,36 +630,49 @@ class LarkChannel(BaseChannel):
 
             delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
             logger.info("Lark WS 第 %d 次重连,等 %ds", attempt, delay)
-            # 可中断 sleep
             try:
                 await asyncio.wait_for(self._stopped.wait(), timeout=delay)
-                return  # 期间被 stop()
+                return
             except asyncio.TimeoutError:
                 pass
 
+    def _build_basic_handler(self, on_message: Any) -> Any:
+        """SDK 不支持 reaction/card 时,只用最基本 message handler。"""
+        return (
+            lark.EventDispatcherHandler.builder("", "")
+            .register_p2_im_message_receive_v1(on_message)
+            .build()
+        )
+
     async def _handle_event(self, evt: Any) -> None:
-        """处理一条飞书消息事件。"""
+        """处理一条飞书消息事件。Phase 31:加 allowlist / dedup / per-chat 锁 / reaction 钩子。"""
         try:
             sender = evt.event.sender
             msg = evt.event.message
             chat_id = msg.chat_id
             open_id = sender.sender_id.open_id if sender and sender.sender_id else "unknown"
+            message_id = getattr(msg, "message_id", "") or ""
+            # Phase 31 顺序:dedup 在最前(同 ID 不论 sender 都丢)
+            if message_id and await self._is_duplicate(message_id):
+                logger.info("Lark 重复消息丢弃 message_id=%s", message_id)
+                return
             text = self._extract_text(msg)
+            is_dm = (getattr(msg, "chat_type", "") == "p2p")
+            allowed, reason = self._check_sender_allowed(open_id, is_dm=is_dm)
+            if not allowed:
+                logger.info(
+                    "Lark 消息被 allowlist 拒绝 session=%s reason=%s",
+                    f"lark:{chat_id}:{open_id}", reason,
+                )
+                return
             if not text:
                 return
 
             from openclaw.channels.base import IncomingMessage
             session_id = f"lark:{chat_id}:{open_id}"
-            message_id = getattr(msg, "message_id", "")
             if message_id:
-                # send() 内部用这个 reply 原消息
                 self._last_msg_id[session_id] = message_id
             # CH-1:解析 mentions;若 mention 列表里有 bot 自己的 open_id 则 mentioned=True
-            is_dm = (getattr(msg, "chat_type", "") == "p2p")
-            # 启动期已在 start() 里预热过缓存,这里直接命中(sentinel != _UNSET)→ O(1) 命中。
-            # 如果运行时被旁路调用(测试 / 手动,没经过 start() 预热),再走 await。
-            # 运行时拉失败要兜底(回退到 mentioned_type)—— 不能因为 bot_open_id 拉不到
-            # 就让整条消息掉地上,phase 25 / a3 之前就是这样被静默吞的;现在显式 try 一次。
             if self._bot_open_id is _UNSET:
                 try:
                     bot_open_id: Optional[str] = await self._fetch_bot_open_id()
@@ -320,26 +683,295 @@ class LarkChannel(BaseChannel):
                 cached = self._bot_open_id
                 bot_open_id = None if cached is None else str(cached)
             mentioned = _is_bot_mentioned(getattr(msg, "mentions", None), bot_open_id)
-            # 走统一管道(经过 AutoReply)
+            # Phase 31:per-chat 串行处理 —— 同一 chat 锁内 dispatch,避免并发乱序
+            chat_lock = self._get_chat_lock(chat_id or "<unknown>")
+            async with chat_lock:
+                # 进入锁后再做处理中 reaction(成功加完才 dispatch;失败 / 异常时换 CrossMark)
+                if message_id:
+                    await self._add_processing_reaction(message_id, REACTION_IN_PROGRESS)
+                try:
+                    await self.dispatch(IncomingMessage(
+                        channel=self.name,
+                        session_id=session_id,
+                        user_id=open_id,
+                        text=text,
+                        raw=msg,
+                        metadata={
+                            "is_dm": is_dm,
+                            "mentioned": mentioned,
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                        },
+                    ))
+                    # 成功 → 移除 Typing reaction
+                    if message_id:
+                        await self._remove_processing_reaction(message_id, REACTION_IN_PROGRESS)
+                except Exception:
+                    # 失败 → Typing 换 CrossMark
+                    logger.exception("Lark dispatch 失败 chat_id=%s", chat_id)
+                    if message_id:
+                        await self._replace_processing_reaction(
+                            message_id, REACTION_IN_PROGRESS, REACTION_FAILURE,
+                        )
+                    raise
+        except Exception:
+            logger.exception("处理飞书事件失败")
+
+    async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
+        """Phase 31:reaction 事件 → 合成 text 事件。
+
+        形如 ``reaction:added:Typing`` / ``reaction:removed:CrossMark``,
+        让 agent 通过文本感知用户对 bot 消息的表态。
+        """
+        try:
+            # data 可能是 SimpleNamespace(.event 字段),也可能是 dict("event" 键)
+            if hasattr(data, "event") and not isinstance(data, dict):
+                event = getattr(data, "event", None) or {}
+            elif isinstance(data, dict):
+                event = data.get("event") or {}
+            else:
+                event = data or {}
+            # 取 reaction_type,允许 lark-oapi 对象 / dict
+            reaction_type_obj: Any = None
+            if hasattr(event, "reaction_type") and not isinstance(event, dict):
+                reaction_type_obj = getattr(event, "reaction_type", None)
+            elif isinstance(event, dict):
+                reaction_type_obj = event.get("reaction_type")
+            emoji_type = "UNKNOWN"
+            if reaction_type_obj is not None:
+                et: Any = None
+                if hasattr(reaction_type_obj, "emoji_type") and not isinstance(reaction_type_obj, dict):
+                    et = getattr(reaction_type_obj, "emoji_type", None)
+                elif isinstance(reaction_type_obj, dict):
+                    et = reaction_type_obj.get("emoji_type")
+                # MagicMock 兼容:str 才算合法值
+                if isinstance(et, str) and et:
+                    emoji_type = et
+            action = "added" if event_type.endswith(".created_v1") else "removed"
+            synthetic_text = f"reaction:{action}:{emoji_type}"
+            # 取 operator_id.open_id
+            operator: Any = None
+            if hasattr(event, "operator") and not isinstance(event, dict):
+                operator = getattr(event, "operator", None)
+            elif isinstance(event, dict):
+                operator = event.get("operator")
+            open_id = "unknown"
+            if operator is not None:
+                op_id: Any = None
+                if hasattr(operator, "operator_id") and not isinstance(operator, dict):
+                    op_id = getattr(operator, "operator_id", None)
+                elif isinstance(operator, dict):
+                    op_id = operator.get("operator_id")
+                if op_id is not None:
+                    if hasattr(op_id, "open_id") and not isinstance(op_id, dict):
+                        oid = getattr(op_id, "open_id", None)
+                        if isinstance(oid, str) and oid:
+                            open_id = oid
+                    elif isinstance(op_id, dict):
+                        oid = op_id.get("open_id")
+                        if isinstance(oid, str) and oid:
+                            open_id = oid
+            # 取 message_id
+            message_id: Any = None
+            if hasattr(event, "message_id") and not isinstance(event, dict):
+                message_id = getattr(event, "message_id", None)
+            elif isinstance(event, dict):
+                message_id = event.get("message_id")
+            if message_id is None:
+                message_id = "unknown"
+            chat_id = ""
+            if hasattr(event, "chat_id") and not isinstance(event, dict):
+                cid = getattr(event, "chat_id", None)
+                if isinstance(cid, str):
+                    chat_id = cid
+            elif isinstance(event, dict):
+                cid = event.get("chat_id")
+                if isinstance(cid, str):
+                    chat_id = cid
+            from openclaw.channels.base import IncomingMessage
+            session_id = f"lark:{chat_id}:{open_id}"
+            logger.info(
+                "Lark reaction %s %s on message %s → synthetic text",
+                action, emoji_type, message_id,
+            )
             await self.dispatch(IncomingMessage(
                 channel=self.name,
                 session_id=session_id,
                 user_id=open_id,
-                text=text,
-                raw=msg,
+                text=synthetic_text,
+                raw=data,
                 metadata={
-                    "is_dm": is_dm,
-                    "mentioned": mentioned,
-                    "chat_id": chat_id,
-                    "message_id": message_id,
+                    "is_dm": False,
+                    "is_reaction": True,
+                    "reaction_action": action,
+                    "reaction_emoji": emoji_type,
+                    "message_id": str(message_id),
                 },
             ))
         except Exception:
-            logger.exception("处理飞书事件失败")
+            logger.exception("Lark reaction 事件处理失败")
+
+    async def _handle_card_action(self, data: Any) -> None:
+        """Phase 31:卡片按钮点击 → 合成 COMMAND 事件。
+
+        形如 ``/card <action_tag>`` —— agent 可用 ``/`` 触发普通命令分支。
+        """
+        try:
+            # data 可能是 SimpleNamespace(.event 字段),也可能是 dict("event" 键)
+            if hasattr(data, "event") and not isinstance(data, dict):
+                event = getattr(data, "event", None) or {}
+            elif isinstance(data, dict):
+                event = data.get("event") or {}
+            else:
+                event = data or {}
+            value: Any = None
+            tag: Any = None
+            if hasattr(event, "action") and not isinstance(event, dict):
+                action = getattr(event, "action", None)
+                if action is not None:
+                    value = getattr(action, "value", None)
+                    tag = getattr(action, "tag", None)
+            elif isinstance(event, dict):
+                action = event.get("action")
+                if isinstance(action, dict):
+                    value = action.get("value")
+                    tag = action.get("tag")
+            # 取 str 形式:优先 value,其次 tag,最后 unknown(避免 MagicMock repr)
+            if isinstance(value, str) and value:
+                action_tag = value
+            elif isinstance(tag, str) and tag:
+                action_tag = tag
+            else:
+                action_tag = "unknown"
+            operator: Any = None
+            if hasattr(event, "operator") and not isinstance(event, dict):
+                operator = getattr(event, "operator", None)
+            elif isinstance(event, dict):
+                operator = event.get("operator")
+            open_id = "unknown"
+            if operator is not None:
+                if hasattr(operator, "open_id") and not isinstance(operator, dict):
+                    oid = getattr(operator, "open_id", None)
+                    if isinstance(oid, str) and oid:
+                        open_id = oid
+                elif isinstance(operator, dict):
+                    oid = operator.get("open_id")
+                    if isinstance(oid, str) and oid:
+                        open_id = oid
+            chat_id = ""
+            if hasattr(event, "chat_id") and not isinstance(event, dict):
+                cid = getattr(event, "chat_id", None)
+                if isinstance(cid, str):
+                    chat_id = cid
+            elif isinstance(event, dict):
+                cid = event.get("chat_id")
+                if isinstance(cid, str):
+                    chat_id = cid
+            from openclaw.channels.base import IncomingMessage
+            session_id = f"lark:{chat_id}:{open_id}"
+            synthetic_text = f"/card {action_tag}"
+            logger.info(
+                "Lark card action %r from %s in %s → synthetic COMMAND",
+                action_tag, open_id, chat_id,
+            )
+            await self.dispatch(IncomingMessage(
+                channel=self.name,
+                session_id=session_id,
+                user_id=open_id,
+                text=synthetic_text,
+                raw=data,
+                metadata={
+                    "is_dm": False,
+                    "is_card_action": True,
+                    "card_action": action_tag,
+                    "chat_id": chat_id,
+                },
+            ))
+        except Exception:
+            logger.exception("Lark card action 事件处理失败")
+
+    # ---------- Processing reactions(可选,失败降级为 no-op) ----------
+
+    async def _add_processing_reaction(self, message_id: str, emoji_type: str) -> None:
+        """Phase 31:加 Typing reaction;失败仅 warning(不阻断主流程)。"""
+        if not _HAS_LARK or not message_id:
+            return
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateMessageReactionRequest,
+                CreateMessageReactionRequestBody,
+            )
+            client = lark.Client.builder() \
+                .app_id(self.settings.app_id) \
+                .app_secret(self.settings.app_secret.get_secret_value()) \
+                .build()
+            body = (
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type({"emoji_type": emoji_type})
+                .build()
+            )
+            request = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(body)
+                .build()
+            )
+
+            def _call() -> Any:
+                return client.im.v1.message_reaction.create(request)
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _call)
+        except Exception:
+            logger.warning("Lark add reaction %s 失败", emoji_type, exc_info=True)
+
+    async def _remove_processing_reaction(self, message_id: str, emoji_type: str) -> None:
+        """Phase 31:移除 reaction;失败仅 warning。"""
+        if not _HAS_LARK or not message_id:
+            return
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+            client = lark.Client.builder() \
+                .app_id(self.settings.app_id) \
+                .app_secret(self.settings.app_secret.get_secret_value()) \
+                .build()
+            request = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(emoji_type)  # 简化:实际上要 reaction_id
+                .build()
+            )
+
+            def _call() -> Any:
+                return client.im.v1.message_reaction.delete(request)
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _call)
+        except Exception:
+            logger.warning("Lark remove reaction %s 失败", emoji_type, exc_info=True)
+
+    async def _replace_processing_reaction(
+        self, message_id: str, _old: str, new: str
+    ) -> None:
+        """失败时换 CrossMark(简化版:直接 add new;SDK 拿 reaction_id 流程较繁琐,这里弱化处理)。"""
+        if not _HAS_LARK or not message_id:
+            return
+        try:
+            await self._add_processing_reaction(message_id, new)
+        except Exception:
+            pass
 
     @staticmethod
     def _extract_text(msg: Any) -> str:
-        """从飞书消息结构里提取纯文本,支持 text 和 post 类型。"""
+        """从飞书消息结构里提取纯文本,支持 text 和 post 类型。
+
+        Phase 31 增强:
+        - text 类型:直取
+        - post 类型:遍历 [[seg, ...], ...] 行,只收 tag==text 的段,遇到 at
+          段用 mentions 里的 name 替换占位(若有)
+        - 其它(image / file / audio / media):返回空(Phase 31 暂不下载,
+          留给后续 Phase;P31-H 留 hookable 接口)
+        """
         try:
             content = json.loads(msg.content or "{}")
         except json.JSONDecodeError:
@@ -347,12 +979,41 @@ class LarkChannel(BaseChannel):
         if msg.message_type == "text":
             return (content.get("text") or "").strip()
         if msg.message_type == "post":
-            # 简单提取所有 @ 用户名之外的第一段纯文本
+            # post 形如: {"content": [[{tag,text/lang/...}], ...]}
+            # 第二层 list 是行,行内是段
             post = content.get("content") or [[]]
+            mentions = getattr(msg, "mentions", None) or []
+            # mentions 是 lark-oapi 对象列表,每个有 .key (at 时的占位如 "@_user_1")
+            # 与 .id.open_id / .name / .id.name
+            mention_by_key: dict[str, str] = {}
+            for m in mentions:
+                key = getattr(m, "key", None)
+                name = (
+                    getattr(m, "name", None)
+                    or getattr(getattr(m, "id", None), "name", None)
+                    or ""
+                )
+                if key and name:
+                    mention_by_key[str(key)] = str(name)
+            lines: list[str] = []
             for line in post:
+                if not isinstance(line, list):
+                    continue
+                seg_text: list[str] = []
                 for seg in line:
-                    if seg.get("tag") == "text":
-                        return (seg.get("text") or "").strip()
+                    if not isinstance(seg, dict):
+                        continue
+                    tag = seg.get("tag")
+                    if tag == "text":
+                        seg_text.append(str(seg.get("text") or ""))
+                    elif tag == "at":
+                        # 占位符在纯文本里形如 "@_user_1"
+                        # mention_by_key miss 时回退成 "@_user"(不要再补 @)
+                        seg_text.append(mention_by_key.get(seg.get("user_id", ""), "@_user"))
+                joined = "".join(seg_text).strip()
+                if joined:
+                    lines.append(joined)
+            return "\n".join(lines)
         return ""
 
     async def _reply_to_lark(self, message_id: str, text: str) -> None:

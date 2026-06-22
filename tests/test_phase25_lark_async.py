@@ -78,7 +78,7 @@ def _build_ch(settings: LarkSettings | None = None) -> LarkChannel:
     """构造一个 LarkChannel,不走 SDK(只测 fetch_bot_open_id / start)。"""
     return LarkChannel(
         _FakeAgent(),
-        settings or LarkSettings(app_id="cli_test", app_secret="sec_test"),
+        settings or LarkSettings(app_id="cli_test", app_secret="sec_test", dedup_path=""),
     )
 
 

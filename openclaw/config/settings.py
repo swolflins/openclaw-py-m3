@@ -36,6 +36,9 @@ class LarkSettings(BaseSettings):
     encrypt_key: Optional[SecretStr] = Field(default=None)
     use_ws: bool = Field(default=True, description="True=长连接, False=Webhook")
     webhook_url: Optional[str] = Field(default=None)
+    # Phase 31:持久化去重 state 的路径(显式传参优先,其次 env,最后默认)。
+    # 设为 "" 时退化为 in-memory(适合测试)。
+    dedup_path: Optional[str] = Field(default=None)
 
 
 class AgentSettings(BaseSettings):

@@ -287,7 +287,7 @@ def test_lark_channel_send_uses_cached_message_id(monkeypatch):
     monkeypatch.setattr(httpx.AsyncClient, "post", _post)
     monkeypatch.setattr(LarkChannel, "_get_tenant_token", _tok)
 
-    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s", dedup_path=""))
     ch._last_msg_id["lark:oc_c1:ou_u1"] = "om_orig"
     asyncio.run(ch.send("lark:oc_c1:ou_u1", "你好"))
     assert "/im/v1/messages/om_orig/reply" in captured["url"]
@@ -310,7 +310,7 @@ def test_lark_channel_send_no_message_id_warns(monkeypatch, caplog):
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _post)
 
-    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s", dedup_path=""))
     # 没 _last_msg_id[session] → 应不发
     import logging
     caplog.set_level(logging.WARNING)
@@ -340,7 +340,7 @@ def test_lark_channel_reply_logs_failure(monkeypatch, caplog):
     monkeypatch.setattr(httpx.AsyncClient, "post", _post)
     monkeypatch.setattr(LarkChannel, "_get_tenant_token", _tok)
 
-    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s", dedup_path=""))
     ch._last_msg_id["lark:oc_1:ou_1"] = "om_1"
 
     caplog.set_level(logging.ERROR)
@@ -390,7 +390,7 @@ def test_lark_e2e_echo_agent_replies_with_cached_message_id(monkeypatch):
 
     monkeypatch.setattr(LarkChannel, "_reply_to_lark", _fake_reply)
 
-    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s", dedup_path=""))
     evt = _make_lark_event(chat_id="oc_c1", open_id="ou_u1", message_id="om_xyz", text="ping")
 
     asyncio.run(ch._handle_event(evt))
@@ -422,7 +422,7 @@ def test_lark_e2e_multiturn_keeps_message_id_for_session(monkeypatch):
 
     monkeypatch.setattr(LarkChannel, "_reply_to_lark", _fake_reply)
 
-    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s", dedup_path=""))
     # 第一条
     e1 = _make_lark_event("oc_c", "ou_u", "om_001", "hi")
     asyncio.run(ch._handle_event(e1))
@@ -447,7 +447,7 @@ def test_lark_e2e_drops_empty_text(monkeypatch):
 
     monkeypatch.setattr(LarkChannel, "_reply_to_lark", _fake_reply)
 
-    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s", dedup_path=""))
     evt = _make_lark_event("oc_c", "ou_u", "om_x", "")  # 空
     asyncio.run(ch._handle_event(evt))
 
@@ -468,7 +468,7 @@ def test_lark_e2e_post_message_extracts_text(monkeypatch):
 
     monkeypatch.setattr(LarkChannel, "_reply_to_lark", _fake_reply)
 
-    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s"))
+    ch = LarkChannel(_FakeAgent(), LarkSettings(app_id="cli_x", app_secret="s", dedup_path=""))
     # post 类型 content
     from lark_oapi.api.im.v1 import (
         P2ImMessageReceiveV1, P2ImMessageReceiveV1Data,
