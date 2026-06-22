@@ -290,7 +290,10 @@ class AgentJournal:
             tool_calls=tc_list,
             duration_ms=duration_ms,
         )
-        # 写文件
+        # 写文件(Phase 27 / M21 修复:record_session 仍是 sync(被外层 to_thread
+        # 包),但内部写文件也走 to_thread —— 即"sync 函数 + sync 内部 to_thread"
+        # 不增加收益;维持原 sync write_text。仅 ``generate_weekly`` 这类被 async
+        # 调用的入口走 to_thread(line 399 / 577 / 638))
         path = Path(self._entry_filename(entry))
         path.write_text(self._entry_to_md(entry), encoding="utf-8")
         logger.info("journal recorded: %s", path)

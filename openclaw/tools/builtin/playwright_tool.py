@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import urllib.parse
 from typing import Any, Optional
 
@@ -88,9 +89,23 @@ class _BrowserHolder:
             # sync_playwright() 必须在 thread 里跑(它是 sync)
             def _start():
                 cls._pw = sync_playwright().start()
+                # M12 修复:``--no-sandbox`` 是 chromium 在 root / 受限容器里
+                # 启动所必需的(否则内核 SUID sandbox 拒绝子进程);
+                # 但它同时关闭浏览器自身的进程隔离,可能放大 RCE 影响。
+                # 行为:
+                # 1) 默认(Docker 容器场景):保留 ``--no-sandbox``(历史行为)
+                # 2) ``OPENCLAW_PLAYWRIGHT_NO_SANDBOX=0`` 显式关 → 不传 --no-sandbox
+                #    (用户在非 root / 已有 seccomp 配置时,可以开 sandbox 加强隔离)
+                # 3) 显式 ``=1`` 与省略等价(向后兼容,留作"显式"意图)
+                chromium_args = ["--disable-dev-shm-usage"]
+                no_sandbox = os.environ.get(
+                    "OPENCLAW_PLAYWRIGHT_NO_SANDBOX", "1"  # 历史行为:默认开
+                )
+                if no_sandbox.lower() not in ("0", "false", "no", "off"):
+                    chromium_args.append("--no-sandbox")
                 cls._browser = cls._pw.chromium.launch(
                     headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                    args=chromium_args,
                 )
                 return cls._browser
             browser = await asyncio.to_thread(_start)

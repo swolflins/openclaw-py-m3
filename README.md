@@ -23,6 +23,55 @@ OpenClaw(原 ClawdBot / Moltbot) 是一个开源、MIT 协议、本地优先的 
 - 🚦 统一异常体系
 - ♻️ 与 TS 版 OpenClaw 的 `SOUL.md` / `AGENTS.md` 目录结构兼容
 
+## 架构总览(Phase 27 / H6)
+
+```
+                    ┌────────────────────────┐
+                    │   IM/CLI 渠道          │
+                    │ (Slack/Discord/Lark/…) │
+                    └──────────┬─────────────┘
+                               │  webhook / WS
+                               ▼
+┌──────────────────────────────────────────────────────────┐
+│  openclaw.gateway.app:create_app (FastAPI)               │
+│  中间件(后入先出):                                       │
+│    CORSMiddleware → Metrics → RequestID → RateLimit →   │
+│      AuthMiddleware                                       │
+│  路由(均挂 /v1 前缀):                                     │
+│    /chat, /chat/stream, /memory, /sessions, /tools,     │
+│    /skills, /channels, /journal                          │
+└──────────┬──────────────────────┬────────────────────────┘
+           │                      │
+           ▼                      ▼
+   ┌──────────────┐     ┌──────────────────────┐
+   │  Channel     │     │  AgentLoop           │
+   │  Manager     │     │  ├ ReAct 循环        │
+   │  (base.py)   │     │  ├ ToolRegistry      │
+   │              │     │  ├ ScopedMemory      │
+   │              │     │  │  ├ .short          │
+   │              │     │  │  ├ .long  (向量)   │
+   │              │     │  │  └ .soul  (SOUL.md)│
+   │              │     │  └ AgentJournal      │
+   │              │     │      (Phase 9 反思)   │
+   └──────┬───────┘     └──────────┬───────────┘
+          │                        │
+          ▼                        ▼
+   ┌──────────────────┐   ┌────────────────────┐
+   │ 渠道 SDK         │   │ Providers          │
+   │ Slack/Discord/   │   │ (openai_compat)    │
+   │ Lark/WhatsApp/   │   │  ├ httpx async     │
+   │ Signal/iMessage  │   │  ├ 指数退避重试     │
+   └──────────────────┘   │  └ 跨 loop 重建    │
+                          └────────────────────┘
+```
+
+**关键不变量**:
+1. 鉴权(AuthMiddleware)是"最内层",401 不会被外层中间件吃掉
+2. CORS 是"最外层",OPTIONS 预检先到达
+3. AgentLoop 单例 + LRU(``_max_agents=128``)防 IM bot 长跑内存增长
+4. per-user memory 隔离:``scope = f"{user_id}:{scope}"``(Phase 25/a5)
+5. 限流 key:默认 client.host,设 ``OPENCLAW_GATEWAY_TRUSTED_PROXY=1`` 走 X-Forwarded-For
+
 ## 项目结构
 
 ```

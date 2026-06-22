@@ -79,10 +79,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if not any(path.startswith(p) for p in _LIMITED_PREFIXES):
             return await call_next(request)
-        # 用 remote addr 作为限流 key(H3 修复:不再用客户端可控的 X-Session-Id)
-        # 旧逻辑:sid = request.headers.get("X-Session-Id") or request.client.host
-        # 攻击者每请求带不同 UUID 即可绕过限流。改为仅用 client.host。
-        sid = request.client.host if request.client else "anon"
+        # M11 修复:限流 key 优先用 ``X-Forwarded-For``(链首,反代后的真实客户端 IP),
+        # 回退 ``X-Real-IP``,再回退 ``client.host``。这让反代后能继续按真实 IP 限流,
+        # 避免"同 proxy_addr 多用户共享一桶"绕过。
+        # 攻击者可控 X-Forwarded-For 仍然能让 IP 变成攻击者想要的值;但
+        # 1) gateway 应只接受可信反代的 X-Forwarded-For(部署文档明示);
+        # 2) 即使不设 XFF,原 client.host 行为保留作为最后兜底。
+        # **生产部署必须**设 ``OPENCLAW_GATEWAY_TRUSTED_PROXY=1`` 显式开启 XFF 解析,
+        # 否则仍用 client.host(防止误信任伪造 XFF)。
+        sid = self._resolve_client_id(request)
         if not self._limiter.allow(sid):
             retry = self._limiter.retry_after(sid)
             return JSONResponse(
@@ -94,6 +99,31 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 headers={"Retry-After": str(max(1, int(retry) + 1))},
             )
         return await call_next(request)
+
+    @staticmethod
+    def _resolve_client_id(request) -> str:
+        """解析限流用的客户端标识。
+
+        优先级:
+        1. ``OPENCLAW_GATEWAY_TRUSTED_PROXY=1`` + ``X-Forwarded-For`` 取首项
+           (反代后真实客户端 IP;裸 starlette/FastAPI 不解析,需运维显式开)
+        2. ``X-Real-IP``(nginx 等单层反代常用)
+        3. ``request.client.host``(直接连接,最后兜底)
+
+        攻击者可在请求里塞任意 ``X-Forwarded-For``;但必须先有 ``TRUSTED_PROXY=1``,
+        否则仍走 client.host(攻击者改不了 TCP 源 IP)。
+        """
+        import os
+        if os.environ.get("OPENCLAW_GATEWAY_TRUSTED_PROXY", "").lower() in ("1", "true", "yes"):
+            xff = request.headers.get("X-Forwarded-For")
+            if xff:
+                first = xff.split(",", 1)[0].strip()
+                if first:
+                    return f"xff:{first}"
+            real = request.headers.get("X-Real-IP")
+            if real:
+                return f"xreal:{real}"
+        return f"peer:{request.client.host}" if request.client else "anon"
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -183,14 +213,77 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Phase 27 / H9 修复:graceful shutdown — 关闭阶段调 channel_manager.stop_all()。
+
+    启动期:
+    - 拿 deps,记 ready 状态
+
+    关闭期:
+    - stop ChannelManager(若有)→ 走 SIGTERM 风格的 cancel + wait
+    - 关 httpx 客户端(providers / channels 都用)→ 防 socket fd 泄露
+    - 全程 try/except 防 shutdown 异常阻断 process exit
+    """
+    import asyncio
     d = get_deps()
     if d.ready():
         ready_info = "ready(agent_loop=attached)"
     else:
         ready_info = "DEGRADED(agent_loop=missing,/v1/chat will 503)"
     logger.info("gateway_started", status=ready_info)
-    yield
-    logger.info("gateway_stopped")
+    try:
+        yield
+    finally:
+        # shutdown 阶段
+        # 1) 停 channels(若有)
+        cm = getattr(d, "channel_manager", None) if d else None
+        if cm is not None and hasattr(cm, "stop_all"):
+            try:
+                await asyncio.wait_for(cm.stop_all(), timeout=10.0)
+                logger.info("gateway_shutdown_channels_stopped")
+            except asyncio.TimeoutError:
+                logger.warning("gateway_shutdown_channels_timeout(10s)")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "gateway_shutdown_channels_failed",
+                    error_type=type(e).__name__,
+                    error=str(e)[:200],
+                )
+
+        # 2) 关 agent_loop 内的 httpx(若暴露 close 接口)
+        agent_loop = getattr(d, "agent_loop", None) if d else None
+        if agent_loop is not None and hasattr(agent_loop, "aclose"):
+            try:
+                await asyncio.wait_for(agent_loop.aclose(), timeout=5.0)
+                logger.info("gateway_shutdown_agent_loop_closed")
+            except asyncio.TimeoutError:
+                logger.warning("gateway_shutdown_agent_loop_timeout(5s)")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "gateway_shutdown_agent_loop_failed",
+                    error_type=type(e).__name__,
+                    error=str(e)[:200],
+                )
+
+        # 3) 关 providers(若在 deps 上挂)
+        providers = getattr(d, "providers", None) if d else None
+        if providers:
+            for prov in providers:
+                aclose = getattr(prov, "aclose", None)
+                if aclose is None:
+                    continue
+                try:
+                    res = aclose()
+                    if asyncio.iscoroutine(res):
+                        await asyncio.wait_for(res, timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.warning("gateway_shutdown_provider_timeout", provider=getattr(prov, "name", "?"))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "gateway_shutdown_provider_failed",
+                        provider=getattr(prov, "name", "?"),
+                        error_type=type(e).__name__,
+                    )
+        logger.info("gateway_stopped")
 
 
 def _validate_cors_origin(origin: str) -> str:
@@ -284,41 +377,51 @@ def _resolve_cors_origin_regex() -> str:
     return r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
 
-def create_app(
-    deps: GatewayDeps | None = None,
+def _install_middlewares(
+    app: FastAPI,
     *,
-    rate_limiter: RateLimiter | None | _DefaultRateLimiterSentinel = _DEFAULT_RATE_LIMITER,
-    host: str | None = None,
-) -> FastAPI:
-    """工厂函数:可以注入自定义 deps(测试用)。
+    host: str,
+    rate_limiter: RateLimiter | None,
+    cors_origins: list[str],
+    cors_regex: str,
+) -> None:
+    """按正确顺序装配中间件(Phase 27 / M15 抽出)。
 
-    ``rate_limiter`` 控制限流中间件行为(Phase 27 / C1 修复):
-    - 不传 / 传 ``_DEFAULT_RATE_LIMITER`` 哨兵 → 走 module-level 单例(env 控制)
-    - 传 ``None`` → 关掉限流(测试/本地开发)
-    - 传 ``RateLimiter`` 实例 → 用这个 limiter
-
-    旧的 ``type(...)`` 默认值哨兵已弃用,签名不再含异质联合告警。
-
-    ``host``(Phase 25):显式传入监听地址 — 0.0.0.0 + 无 token 视为生产部署,
-    启动期 fail-fast。默认从 ``OPENCLAW_GATEWAY_HOST`` env 读;测试可显式传。
-
-    Phase 25/b9:
-    - 挂 CORS 中间件:dev 默认允许 ``localhost / 127.0.0.1``,prod 关闭。
-    - 启动时若 ``is_production_mode()`` → ``app.docs_url / redoc_url / openapi_url`` 全部置 None。
+    顺序(后入先出,最末 add 最先执行):
+    1. 鉴权(``install_auth``)— 401 在最内
+    2. 限流
+    3. RequestID
+    4. Metrics
+    5. CORS(最外)— OPTIONS 预检先到达,不被鉴权/限流挡
     """
-    # NEW-1:生产模式无 token → 启动期直接拒绝
-    from openclaw.gateway.auth import require_token_in_production, is_production_mode, is_dev_mode
-    require_token_in_production()
+    from openclaw.gateway.auth import install_auth
 
-    # Phase 25:host=0.0.0.0 但 token 未配置 → 启动期 fail-fast
-    # 0.0.0.0 视为对外暴露(类似 production),127.0.0.1 仍允许 dev。
-    _host = host if host is not None else os.environ.get("OPENCLAW_GATEWAY_HOST", "127.0.0.1")
+    install_auth(app, host=host)
+    app.add_middleware(RateLimitMiddleware, rate_limiter=rate_limiter)
+    app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(MetricsMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_origin_regex=cors_regex or None,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        allow_headers=["*"],
+        max_age=600,
+    )
+
+
+def _validate_startup_security(host: str) -> str:
+    """启动期安全校验(Phase 27 / M15 抽出)。
+
+    输入 ``host``(默认从 env 读),返回校验后的 host(供 ``create_app`` 用)。
+    抛 ``RuntimeError`` 表示启动期 fail-fast — 阻止未鉴权部署。
+    """
+    from openclaw.gateway.auth import is_dev_mode
     _token_raw = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
     # H1 修复:无 token + 非 dev 模式 → fail-closed(不论 host)
-    # 防止 uvicorn --host 0.0.0.0 绕过上面的 host 检查
-    # 注意:dev 模式下允许 0.0.0.0 + 无 token(本地开发/Docker smoke test)
     if not _token_raw and not is_dev_mode():
-        if _host == "0.0.0.0":
+        if host == "0.0.0.0":
             raise RuntimeError(
                 "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
                 "为防止未鉴权部署,启动被拒绝。请设置: "
@@ -331,68 +434,23 @@ def create_app(
             "  1. 设置 token:export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')\n"
             "  2. 本地开发:export OPENCLAW_GATEWAY_DEV=1"
         )
+    return host
 
-    # Phase 25/b9:prod 模式关 docs(避免暴露内部 API 描述)
-    _docs_url: str | None = "/docs"
-    _redoc_url: str | None = "/redoc"
-    _openapi_url: str | None = "/openapi.json"
+
+def _resolve_docs_urls() -> dict[str, str | None]:
+    """解析 docs / redoc / openapi URL(prod 模式全关,Phase 25/b9)。"""
+    from openclaw.gateway.auth import is_production_mode
+    urls = {"/docs": "/docs", "/redoc": "/redoc", "/openapi.json": "/openapi.json"}
     if is_production_mode():
-        _docs_url = None
-        _redoc_url = None
-        _openapi_url = None
+        urls = {k: None for k in urls}
+    return urls
 
-    app = FastAPI(
-        title="OpenClaw Gateway",
-        version="0.1.0",
-        description="OpenClaw Python 的统一 HTTP 入口(Phase 8)。",
-        lifespan=_lifespan,
-        docs_url=_docs_url,
-        redoc_url=_redoc_url,
-        openapi_url=_openapi_url,
-    )
-    if deps is not None:
-        from openclaw.gateway.deps import set_deps
-        set_deps(deps)
 
-    # 中间件:顺序很重要
-    # 1. 鉴权(SEC-1)— 配置 OPENCLAW_GATEWAY_TOKEN 后启用,未配置则仅 dev
-    # 2. 限流(SEC-12)— 对 /v1/chat / /v1/channels/send 生效
-    # 3. RequestID(SEC-11)— 注入 request_id
-    # 4. Metrics(SEC-12)— 收集 path/method/status,降基数
-    from openclaw.gateway.auth import install_auth
-    # 启动期已 fail-fast,这里把 host 透传给 AuthMiddleware 做双层保险
-    install_auth(app, host=_host)
-    # 限流:用户显式 None 关掉;否则走 module-level 单例(Phase 27 / C1:用 sentinel 类判断)
-    rl = _RATE_LIMITER if isinstance(rate_limiter, _DefaultRateLimiterSentinel) else rate_limiter
-    if rl is None:
-        # 传 None 时挂一个 None 限流的 middleware(等同禁掉)
-        app.add_middleware(RateLimitMiddleware, rate_limiter=None)
-    else:
-        app.add_middleware(RateLimitMiddleware, rate_limiter=rl)
-    app.add_middleware(RequestIDMiddleware)
-    app.add_middleware(MetricsMiddleware)
+def _register_routes(app: FastAPI) -> None:
+    """注册所有网关路由(Phase 27 / M15 抽出)。"""
+    from fastapi.staticfiles import StaticFiles
+    from pathlib import Path
 
-    # Phase 25/b9:CORS — dev 默认允许 localhost / 127.0.0.1,prod 关闭。
-    # 注意:必须放在最后一个 ``add_middleware`` —— Starlette 中间件以"后入先出"顺序执行,
-    # 我们的目标是让 CORS 的 OPTIONS 预检**先**到达(必须在 AuthMiddleware / RateLimitMiddleware 之前),
-    # 所以逻辑上 CORS 是"最外层",即最后 add。
-    _cors_origins = _resolve_cors_origins()
-    _cors_regex = _resolve_cors_origin_regex()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_origin_regex=_cors_regex or None,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-        allow_headers=["*"],
-        max_age=600,
-    )
-
-    # 全局异常处理(SEC-11)— 500 错误不外露原始异常消息
-    from openclaw.gateway.errors import register_error_handlers
-    register_error_handlers(app)
-
-    # 注册路由
     app.include_router(health.router)
     app.include_router(chat.router, prefix="/v1")
     app.include_router(sessions.router, prefix="/v1")
@@ -402,16 +460,12 @@ def create_app(
     app.include_router(channels.router, prefix="/v1")
     app.include_router(journal.router, prefix="/v1")
 
-    # Phase 27 / C2 修复:root_index 路由从 if 块内提升到顶层(无论 static_dir 是否存在),
-    # 避免"启动即确定"原则被破坏。/ui mount 仍保留 try/except 保护。
-    from fastapi.staticfiles import StaticFiles
-    from pathlib import Path
-
+    # C2 修复:root_index 路由从 if 块内提升到顶层(无论 static_dir 是否存在)。
     static_dir = Path(__file__).resolve().parent / "static"
     if static_dir.exists():
         try:
             app.mount("/ui", StaticFiles(directory=str(static_dir), html=True), name="ui")
-        except Exception as e:  # pragma: no cover  # 防御性:StaticFiles 不应 fail
+        except Exception as e:  # pragma: no cover
             logger.warning("static_files_mount_failed", error=str(e))
 
     @app.get("/", include_in_schema=False)
@@ -424,6 +478,62 @@ def create_app(
             "healthz": "/healthz",
         }
 
+
+def create_app(
+    deps: GatewayDeps | None = None,
+    *,
+    rate_limiter: RateLimiter | None | _DefaultRateLimiterSentinel = _DEFAULT_RATE_LIMITER,
+    host: str | None = None,
+) -> FastAPI:
+    """工厂函数(Phase 27 / M15:主函数只剩 ~50 行流程)。
+
+    流程:
+    1. 启动期安全校验(token / host / production 模式)
+    2. 构造 FastAPI 实例 + lifespan
+    3. 注入 deps
+    4. 装中间件(走 ``_install_middlewares``)
+    5. 注册异常 handler + 路由(走 ``_register_routes``)
+
+    ``rate_limiter`` 行为(Phase 27 / C1):
+    - 传 ``_DEFAULT_RATE_LIMITER`` 哨兵 → module-level 单例(env 控制)
+    - 传 ``None`` → 关闭
+    - 传 ``RateLimiter`` 实例 → 用之
+
+    ``host`` 行为(Phase 25):0.0.0.0 视为对外暴露 + 启动期 fail-fast。
+    """
+    from openclaw.gateway.auth import require_token_in_production
+    require_token_in_production()
+
+    _host = host if host is not None else os.environ.get("OPENCLAW_GATEWAY_HOST", "127.0.0.1")
+    _validate_startup_security(_host)
+    _docs = _resolve_docs_urls()
+
+    app = FastAPI(
+        title="OpenClaw Gateway",
+        version="0.1.0",
+        description="OpenClaw Python 的统一 HTTP 入口(Phase 8)。",
+        lifespan=_lifespan,
+        docs_url=_docs["/docs"],
+        redoc_url=_docs["/redoc"],
+        openapi_url=_docs["/openapi.json"],
+    )
+    if deps is not None:
+        from openclaw.gateway.deps import set_deps
+        set_deps(deps)
+
+    _install_middlewares(
+        app,
+        host=_host,
+        rate_limiter=(
+            _RATE_LIMITER if isinstance(rate_limiter, _DefaultRateLimiterSentinel) else rate_limiter
+        ),
+        cors_origins=_resolve_cors_origins(),
+        cors_regex=_resolve_cors_origin_regex(),
+    )
+
+    from openclaw.gateway.errors import register_error_handlers
+    register_error_handlers(app)
+    _register_routes(app)
     return app
 
 

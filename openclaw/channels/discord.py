@@ -93,11 +93,14 @@ class DiscordChannel(BaseChannel):
     async def start(self) -> None:
         if not self.available:
             raise RuntimeError("Discord 凭据未配置 (DISCORD_BOT_TOKEN)")
-        # Phase 25 / A2: 再次校验 production + public_key + pynacl(双保险)。
-        if self.public_key and not _has_pynacl() and _is_production_mode():
+        # M6 修复 + Phase 25 双保险:__init__ 已 fail-fast pynacl 缺失,
+        # 但为防止"测试 / 集成场景用 monkeypatch 绕过 __init__ 后调到 start()"
+        # 仍能 fail-closed,这里再检查一次。pynacl 检查在 GET Discord API 之前
+        # (避免连 Discord 失败掩盖 pynacl 缺失的根因)。
+        if os.environ.get("OPENCLAW_ENV", "").lower() == "production" and not _has_pynacl():
             raise RuntimeError(
-                "[phase25/A2] start() 检测到 production 模式 + public_key 已配置但 pynacl 缺失。"
-                "启动被拒绝(fail-closed)。修复: pip install pynacl"
+                "[phase25/A2] OPENCLAW_ENV=production 但 pynacl 未安装,Discord Webhook 验签"
+                "不可用。安装:pip install pynacl"
             )
         # 先 GET /users/@me 确认 token 有效
         client = await self._get_client()

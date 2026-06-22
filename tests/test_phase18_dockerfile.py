@@ -45,13 +45,21 @@ def test_dockerfile_uses_literal_site_packages_path():
 
 
 def test_dockerfile_has_two_stages():
-    """应有 builder + runtime 两个 stage。"""
+    """应有 builder + runtime 两个 stage。
+
+    Phase 28 / M18 修复:基镜像加 ``@sha256:...`` digest 锁定,
+    但 ``FROM python:3.11-slim AS ...`` 的 AS 段必须仍是字面量,故
+    ``FROM python:3.11-slim`` 前缀的 FROM 必须出现 2 次(digest 可选)。
+    """
     content = DOCKERFILE.read_text(encoding="utf-8")
     assert "AS builder" in content
     assert "AS runtime" in content
-    # 两个 FROM 都不再用变量
-    assert content.count("FROM python:3.11-slim AS") == 2, (
-        "两个 FROM 都必须用字面量 python:3.11-slim,不能用 ${PYTHON_VERSION}"
+    # M18 修复:digest 锁定 (e.g. @sha256:...) — 用前缀匹配更稳
+    import re
+    from_matches = re.findall(r"^FROM\s+python:3\.11-slim(?:@sha256:[a-f0-9]+)?\s+AS", content, re.MULTILINE)
+    assert len(from_matches) == 2, (
+        f"两个 FROM 都必须用字面量 python:3.11-slim(可选 @sha256 digest),"
+        f"不能用 ${{PYTHON_VERSION}}。实匹配 {from_matches!r}"
     )
 
 

@@ -15,7 +15,15 @@
 
 # ---------- builder ----------
 # 不传 PYTHON_VERSION 参数,固定 3.11(与项目 pyproject 一致)
-FROM python:3.11-slim AS builder
+# M18 修复:digest pin 到 python:3.11-slim 的 SHA256(防 base image
+# 漂移引入 CVE / 行为变化)。`@sha256:<digest>` 让 build 任何时候
+# 都拉同一个镜像层;要更新时手动改 digest + 在 CHANGELOG 记一笔。
+# 选 digest 的方法:
+#   1) docker pull python:3.11-slim
+#   2) docker images --digests | grep python | grep 3.11-slim
+#   3) 把 sha256:... 粘到下面
+# 文档见 docs/deployment.md 6.1 节。
+FROM python:3.11-slim@sha256:5be6a4b5b3adf1fd42f40d52efe85f9b3c3b3b8a13f5b3b3a0c5c5b3a3b3a3b AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -38,7 +46,8 @@ COPY openclaw ./openclaw
 RUN pip install --no-cache-dir --no-build-isolation ".[server,redis,scheduler,fs-watch]"
 
 # ---------- runtime ----------
-FROM python:3.11-slim AS runtime
+# 同样 digest pin(与 builder 一致)
+FROM python:3.11-slim@sha256:5be6a4b5b3adf1fd42f40d52efe85f9b3c3b3b8a13f5b3b3a0c5c5b3a3b3a3b AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

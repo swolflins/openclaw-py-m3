@@ -33,9 +33,13 @@ services:
       OPENCLAW_LOG_LEVEL: ${OPENCLAW_LOG_LEVEL:-INFO}
       OPENCLAW_GATEWAY_HOST: 0.0.0.0
       OPENCLAW_GATEWAY_PORT: "8080"
-      # ENG-4:网关鉴权 token(必设,生产未设 = 所有 /v1/* 任何人可调)
+      # ENG-4 / M19:网关鉴权 token(必设,生产未设 = 所有 /v1/* 任何人可调)
       # 启动:openssl rand -hex 32 → 写进 .env
-      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
+      # M19 修复:不再用 `${...:-}` 空串默认值(空串 = 等于没设,gateway 启动期
+      # 在 prod 模式会 fail-fast;但 dev 模式会被静默放过 → 部署到生产忘设时
+      # 端口在 0.0.0.0 暴露且无鉴权)。改用 `?error:missing-OPENCLAW_GATEWAY_TOKEN`
+      # 触发 docker compose 显式报错,运维一眼能看到 .env 没设。
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?OPENCLAW_GATEWAY_TOKEN 未设置,请用 'openssl rand -hex 32' 生成后写入 .env}
       # LLM 凭据(从 .env 读)
       OPENCLAW_LLM__OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENCLAW_LLM__ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}

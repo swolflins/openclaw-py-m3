@@ -90,3 +90,30 @@ clean:  ## 清缓存 / 临时文件
 
 distclean: clean  ## clean + 删 egg-info / dist
 	rm -rf *.egg-info dist build
+
+# === Phase 27 / H10 — 发布到 PyPI ===
+build-dist:  ## 构 sdist + wheel
+	$(PY) -m pip install --upgrade build
+	$(PY) -m build
+
+check-dist:  ## 用 twine 检查 dist 完整性
+	$(PY) -m pip install --upgrade twine
+	$(PY) -m twine check dist/*
+
+publish-test: build-dist check-dist  ## 上传到 test.pypi.org
+	$(PY) -m twine upload --repository testpypi dist/*
+
+publish: build-dist check-dist  ## 上传到正式 PyPI(慎用,需要 ~/.pypirc 配置)
+	@echo "==> 准备上传到正式 PyPI;按 Ctrl-C 取消 / Enter 继续"
+	@read _
+	$(PY) -m twine upload dist/*
+
+# === Phase 27 / H2 — lockfile ===
+lock:  ## 把当前所有 extras 依赖 freeze 到 requirements.lock(可重现部署)
+	$(PIP) install -e ".[all]"
+	$(PIP) freeze | grep -v 'openclaw-py' > requirements.lock
+	@echo "==> requirements.lock 已生成($$(wc -l < requirements.lock) 行)"
+
+verify-lock:  ## 用 lockfile 重装一遍(检查 lock 与 pyproject 一致)
+	$(PIP) install -r requirements.lock
+	@echo "==> lockfile 重装通过"

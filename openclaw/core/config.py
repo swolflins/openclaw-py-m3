@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from openclaw.core.errors import ConfigError
 from openclaw.core.logging import get_logger
@@ -65,7 +65,35 @@ class ToolsConfig(BaseModel):
     include: list[str] | None = None
     exclude: list[str] | None = None
     # 允许非内置工具以模块路径方式注入(Phase 5+)
+    # M8 修复:走 Pydantic field_validator 校验 — 模块路径必须是合法的
+    # Python import 路径(dotted module,无 .. / 绝对路径 / 非法字符),
+    # 否则构造期就拒。同目录 / 相对路径都不允许(防任意本地 .py 加载)。
     extras: list[str] = Field(default_factory=list)
+
+    @field_validator("extras")
+    @classmethod
+    def _validate_extras_paths(cls, v: list[str]) -> list[str]:
+        import re
+
+        if not v:
+            return v
+        # Python module path 规范:字母/数字/下划线 + 点分隔,起头不能是点
+        # (M8 防止 ``../../../etc/passwd`` / ``/abs/path`` / ``os`` / ``__import__``)
+        mod_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+        bad: list[str] = []
+        for path in v:
+            if not isinstance(path, str) or not path:
+                bad.append(f"<non-str: {type(path).__name__}>")
+                continue
+            if not mod_re.match(path):
+                bad.append(path)
+        if bad:
+            raise ValueError(
+                f"tools.extras 含非法模块路径 {bad!r};"
+                f"必须是合法 Python module path,如 'mypkg.tools.mymod'"
+            )
+        # 去重
+        return list(dict.fromkeys(v))
 
 
 class RateLimitConfig(BaseModel):
@@ -104,8 +132,12 @@ class ChannelRuntimeConfig(BaseModel):
     """Phase 7:多 channel 启动配置。"""
     # 启用的 channel 列表(channel 名 = 渠道类型,见 openclaw.channels)
     enabled: list[str] = Field(default_factory=lambda: ["cli"])
-    # 通用 webhook 入口(走 FastAPI 路由的 channel 用,Phase 8 接进来)
-    webhook_host: str = "0.0.0.0"
+    # M10 修复:webhook_host 默认值从 "0.0.0.0"(对外暴露)→ "127.0.0.1"(仅本地)
+    # 旧默认与 OPENCLAW_GATEWAY_DEV 联动时,会无意中把 webhook 端点暴露到
+    # 公网;运维如需对外监听,必须显式设 0.0.0.0(意图明显)。
+    # 注:webhook 路径要走 FastAPI 路由层(M/H1 修复),默认 localhost 与
+    # gateway 默认 127.0.0.1 一致。
+    webhook_host: str = "127.0.0.1"
     webhook_port: int = 8088
     webhook_path: str = "/webhook/{channel}"
     # 单独的 channel 配置(免去每个 channel 单独写 env 解析)

@@ -45,3 +45,49 @@ make test            # 只跑 pytest (无 coverage gate)
 - ❌ **不要只跑本地 `pytest` 就 push** — 本地与 CI 环境差异会导致"本地过 CI 挂"
 - ❌ **不要相信 `git log --oneline` 没有红就认为 CI 没问题** — 邮件通知的是历史 run
 - ❌ **不要堆 "fix CI" 的 empty commit** — 修根本原因,而非加 `git commit --allow-empty`
+
+## 提交 PR 前清单 (Phase 27 / H8)
+
+每个 PR / commit 在 `git commit` 之前必须自查:
+
+### 1. 测试 (Required)
+
+- [ ] **新代码有测试** — 每个 fix / feat 都对应一个或多个 pytest 用例
+- [ ] **测试加在 `tests/test_phase<N>.py`** — 按 phase 编号(已有 phase 1-27 编号体系)
+- [ ] **修复 bug 的 case 加 `_regression` 后缀** — 例如 `test_cron_shell_rce_regression`,方便后续审计
+- [ ] **跑全套无回归** — `python -m pytest tests/ -q --no-cov` 应当 0 failed(允许 8 个 pre-existing 环境缺失失败)
+
+### 2. 代码质量 (Required)
+
+- [ ] `ruff check openclaw/ tests/` 无 issue
+- [ ] 新函数 / 方法有 docstring(类型注解 + 一句话功能说明)
+- [ ] 改 BC-breaking 字段时在 `CHANGELOG.md` 写明(默认行为可以兼容旧代码不算 BC)
+- [ ] 改 public API 时写 "Notes for Upgraders" 段
+
+### 3. 文档 (Recommended)
+
+- [ ] README 改了 → 在 PR 描述里 link 到具体行号
+- [ ] 新增 CLI 子命令 → 在 `openclaw/cli/commands/__init__.py` 同步注册
+- [ ] 新增配置字段 → 在 `pyproject.toml` 的 `[project.optional-dependencies]` 同步
+- [ ] 新增 env var → 在 README / .env.example 同步
+
+### 4. 安全 (Required, 无法绕过)
+
+- [ ] 不引入 `shell=True`(除非已有 shlex + 拒绝元字符)
+- [ ] 不引入 `pickle.loads` / `yaml.load`(用 `yaml.safe_load`)
+- [ ] 不引入 `subprocess.run` 不带 timeout
+- [ ] 改 secret 路径时确认 `SecretStr` + `model_dump(mode="python")` 链路
+- [ ] 改路由时确认 5xx 走 `_safe_http_500`(memory.py)或同等脱敏模式
+
+### 5. Commit 格式 (Recommended)
+
+```
+<type>(<scope>): <subject>
+
+<body>
+```
+
+type: `fix` / `feat` / `refactor` / `docs` / `test` / `chore`
+scope: `gateway` / `agent` / `cli` / `channels` / `core` / `phase27` / `phase28`...
+
+参考 `.git/COMMIT_EDITMSG` 最近 10 条 commit 风格。
