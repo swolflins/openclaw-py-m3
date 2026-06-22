@@ -82,22 +82,36 @@ def root(
     )
 
 
-def main() -> None:
-    """pyproject.toml 入口:openclaw = "openclaw.cli:main"。"""
+def _run_app(argv: Optional[list[str]] = None) -> None:
+    """run app with CLIError → exit code translation.
+
+    CliRunner.invoke 直接调 app 会绕过 main 包装(且 typer 自身 catch
+    CLIError 时退 1),所以这里让 app() 走 main 的 try/except 逻辑。
+    """
+    if argv is not None:
+        sys.argv = [sys.argv[0]] + list(argv)
     try:
         app()
     except CLIError as e:
-        # 命令内部抛出的 CLIError(未自行 catch 的)
-        sys.exit(handle_error(e, verbose=False))
+        verbose = "--verbose" in sys.argv or "-v" in sys.argv
+        sys.exit(handle_error(e, verbose=verbose))
     except KeyboardInterrupt:
         print("\n已中断", file=sys.stderr)
         sys.exit(130)
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
-        # 从 ctx.obj 取 verbose 不现实(异常路径),默认不详细
         verbose = "--verbose" in sys.argv or "-v" in sys.argv
         sys.exit(handle_error(e, verbose=verbose))
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    """pyproject.toml 入口:openclaw = "openclaw.cli:main"。
+
+    接受可选 argv 列表(用于 CliRunner / 编程调用);
+    省略时读 sys.argv[1:]。
+    """
+    _run_app(argv)
 
 
 __all__ = ["app", "main", "CLIContext"]

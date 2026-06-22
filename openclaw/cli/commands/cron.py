@@ -1,31 +1,51 @@
-"""``openclaw cron`` —— 定时任务管理。
+"""``openclaw cron`` —— 定时任务管理(基于 apscheduler BackgroundScheduler)。
 
-基于内部 ``openclaw.tools.builtin.cron.CronManager``(APScheduler)。
 注意:CronManager 是进程内单例,本命令管理的是当前进程的定时任务。
 若 gateway 已启动且挂载了 cron tools,可通过 gateway 调用(此处直接用本地单例)。
 
 子命令:
   list              列出当前定时任务
-  remove <id>       删除指定任务
-  add --expr "*/5 * * * *" --command "shell echo hi"   添加 cron 任务(简化版)
+  add               添加 cron 任务(简化版,执行 shell 命令)
+  show JOB_ID       展示任务详情
+  edit JOB_ID       修改任务触发时间(替换)
+  remove JOB_ID     删除指定任务
+  enable JOB_ID     启用(取消 paused)
+  disable JOB_ID    暂停(paused)
+  run JOB_ID        立即跑一次(调试)
+  runs              显示 run history
 """
 from __future__ import annotations
 
-from typing import Optional
+import subprocess
+from typing import Any, Optional
 
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError
+from openclaw.cli.errors import CLIError, EXIT_NOT_FOUND
+
+
+# 进程内 run history(最大 100 条,FIFO 淘汰)
+_RUN_HISTORY: list[dict[str, Any]] = []
+_MAX_HISTORY = 100
+
+
+def _record_run(jid: str, status: str, output: str) -> None:
+    import time as _time
+    _RUN_HISTORY.append({
+        "job_id": jid,
+        "ts": _time.time(),
+        "status": status,
+        "output": output[:500],  # 截断避免 OOM
+    })
+    if len(_RUN_HISTORY) > _MAX_HISTORY:
+        del _RUN_HISTORY[: len(_RUN_HISTORY) - _MAX_HISTORY]
 
 
 def _cron_app() -> typer.Typer:
-    cr_app = typer.Typer(help="定时任务管理:list / add / remove", no_args_is_help=True)
+    cr_app = typer.Typer(help="定时任务管理:list / add / show / edit / remove / enable / disable / run / runs", no_args_is_help=True)
 
-    @cr_app.command("list")
-    def cron_list(ctx: typer.Context) -> None:
-        """列出当前定时任务。"""
-        cli_ctx = get_ctx(ctx.obj)
+    def _mgr():
         try:
             from openclaw.tools.builtin.cron import get_cron_manager
         except ImportError as e:
@@ -34,44 +54,82 @@ def _cron_app() -> typer.Typer:
                 exit_code=3,
                 hint="安装 scheduler extras:pip install 'openclaw-py[scheduler]'",
             ) from e
+        return get_cron_manager()
 
-        mgr = get_cron_manager()
+    @cr_app.command("list")
+    def cron_list(ctx: typer.Context) -> None:
+        """列出当前定时任务。"""
+        cli_ctx = get_ctx(ctx.obj)
+        mgr = _mgr()
         jobs = mgr.list_jobs()
         rows = [
-            [j.get("id", "?"), j.get("expr", j.get("trigger", "?")), j.get("next_run", "?"), j.get("name", "")]
+            [j.get("id", "?"), j.get("trigger", "?"), j.get("next_run") or "-", "✓" if not j.get("paused", False) else "✗"]
             for j in jobs
         ]
-        cli_ctx.output.table(["id", "trigger", "next_run", "name"], rows, title=f"定时任务 ({len(jobs)})")
+        cli_ctx.output.table(["id", "trigger", "next_run", "enabled"], rows, title=f"定时任务 ({len(jobs)})")
 
     @cr_app.command("add")
     def cron_add(
         ctx: typer.Context,
         expr: str = typer.Option(..., "--expr", "-e", help="cron 表达式,如 '*/5 * * * *'"),
         command: str = typer.Option(..., "--command", "-c", help="要执行的 shell 命令"),
-        name: Optional[str] = typer.Option(None, "--name", help="任务名"),
+        name: Optional[str] = typer.Option(None, "--name", help="任务名(备注)"),
     ) -> None:
         """添加 cron 任务(执行 shell 命令)。
 
         注意:此为简化版,任务在当前进程内调度。要持久化需配合 gateway 长驻。
         """
         cli_ctx = get_ctx(ctx.obj)
-        try:
-            from openclaw.tools.builtin.cron import get_cron_manager
-        except ImportError as e:
-            raise CLIError(
-                f"cron 模块不可用: {e}", exit_code=3,
-                hint="pip install 'openclaw-py[scheduler]'",
-            ) from e
-
-        import subprocess
-
-        mgr = get_cron_manager()
+        mgr = _mgr()
 
         def _run():
-            subprocess.run(command, shell=True, capture_output=True)
+            try:
+                proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+                _record_run(jid, "ok" if proc.returncode == 0 else "fail", proc.stdout + proc.stderr)
+            except subprocess.TimeoutExpired:
+                _record_run(jid, "timeout", "shell command timed out (60s)")
 
         jid = mgr.add_cron(expr, _run)
         cli_ctx.output.success(f"已添加 cron 任务: {jid} (expr={expr})")
+
+    @cr_app.command("show")
+    def cron_show(
+        ctx: typer.Context,
+        job_id: str = typer.Argument(..., help="任务 id"),
+    ) -> None:
+        """展示任务详情。"""
+        cli_ctx = get_ctx(ctx.obj)
+        mgr = _mgr()
+        for j in mgr.list_jobs():
+            if j.get("id") == job_id:
+                cli_ctx.output.print(j, title=f"cron job {job_id}")
+                return
+        raise CLIError(f"任务不存在: {job_id}", exit_code=EXIT_NOT_FOUND)
+
+    @cr_app.command("edit")
+    def cron_edit(
+        ctx: typer.Context,
+        job_id: str = typer.Argument(..., help="任务 id"),
+        expr: str = typer.Option(..., "--expr", "-e", help="新的 cron 表达式"),
+    ) -> None:
+        """修改任务触发表达式(替换 cron_trigger,保留原 callback)。"""
+        cli_ctx = get_ctx(ctx.obj)
+        mgr = _mgr()
+        # apscheduler 0.4+ 暴露 _bg 对象,reschedule_job 是公开 API
+        bg = mgr._ensure_bg()  # noqa: SLF001
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+        except ImportError as e:
+            raise CLIError(f"apscheduler 不可用: {e}", exit_code=3) from e
+        try:
+            trig = CronTrigger.from_crontab(expr)
+        except Exception as e:  # noqa: BLE001
+            raise CLIError(f"bad cron expr {expr!r}: {e}", exit_code=2) from e
+        try:
+            bg.reschedule_job(job_id, trigger=trig)
+        except Exception as e:  # noqa: BLE001
+            raise CLIError(f"任务不存在或修改失败: {e}", exit_code=EXIT_NOT_FOUND) from e
+        cli_ctx.output.success(f"已更新 cron 任务 {job_id} → expr={expr}")
 
     @cr_app.command("remove")
     def cron_remove(
@@ -80,17 +138,89 @@ def _cron_app() -> typer.Typer:
     ) -> None:
         """删除指定定时任务。"""
         cli_ctx = get_ctx(ctx.obj)
-        try:
-            from openclaw.tools.builtin.cron import get_cron_manager
-        except ImportError as e:
-            raise CLIError(f"cron 模块不可用: {e}", exit_code=3) from e
-
-        mgr = get_cron_manager()
+        mgr = _mgr()
         ok = mgr.remove(job_id)
         if ok:
             cli_ctx.output.success(f"已删除: {job_id}")
         else:
-            raise CLIError(f"任务不存在: {job_id}", exit_code=5)
+            raise CLIError(f"任务不存在: {job_id}", exit_code=EXIT_NOT_FOUND)
+
+    @cr_app.command("enable")
+    def cron_enable(
+        ctx: typer.Context,
+        job_id: str = typer.Argument(..., help="任务 id"),
+    ) -> None:
+        """启用(取消 paused)。"""
+        cli_ctx = get_ctx(ctx.obj)
+        mgr = _mgr()
+        bg = mgr._ensure_bg()  # noqa: SLF001
+        try:
+            bg.resume_job(job_id)
+        except Exception as e:  # noqa: BLE001
+            raise CLIError(f"任务不存在或启用失败: {e}", exit_code=EXIT_NOT_FOUND) from e
+        cli_ctx.output.success(f"已启用: {job_id}")
+
+    @cr_app.command("disable")
+    def cron_disable(
+        ctx: typer.Context,
+        job_id: str = typer.Argument(..., help="任务 id"),
+    ) -> None:
+        """暂停(paused,仍保留任务但不触发)。"""
+        cli_ctx = get_ctx(ctx.obj)
+        mgr = _mgr()
+        bg = mgr._ensure_bg()  # noqa: SLF001
+        try:
+            bg.pause_job(job_id)
+        except Exception as e:  # noqa: BLE001
+            raise CLIError(f"任务不存在或暂停失败: {e}", exit_code=EXIT_NOT_FOUND) from e
+        cli_ctx.output.success(f"已暂停: {job_id}")
+
+    @cr_app.command("run")
+    def cron_run(
+        ctx: typer.Context,
+        job_id: str = typer.Argument(..., help="任务 id"),
+    ) -> None:
+        """立即跑一次(调试用,不影响原 schedule)。"""
+        cli_ctx = get_ctx(ctx.obj)
+        mgr = _mgr()
+        bg = mgr._ensure_bg()  # noqa: SLF001
+        try:
+            job = bg.get_job(job_id)
+        except Exception as e:  # noqa: BLE001
+            raise CLIError(f"任务不存在: {e}", exit_code=EXIT_NOT_FOUND) from e
+        if job is None:
+            raise CLIError(f"任务不存在: {job_id}", exit_code=EXIT_NOT_FOUND)
+        # 同步调 callback
+        try:
+            job.func(*job.args, **job.kwargs)
+            cli_ctx.output.success(f"已手动触发: {job_id}")
+        except Exception as e:  # noqa: BLE001
+            raise CLIError(f"执行失败: {e}", exit_code=1) from e
+
+    @cr_app.command("runs")
+    def cron_runs(
+        ctx: typer.Context,
+        job_id: Optional[str] = typer.Option(None, "--id", help="只显示某 job_id 的记录"),
+        limit: int = typer.Option(20, "--limit", "-n", help="最多显示 N 条"),
+    ) -> None:
+        """显示 run history(进程内,最近 100 条)。"""
+        cli_ctx = get_ctx(ctx.obj)
+        items = _RUN_HISTORY
+        if job_id:
+            items = [r for r in items if r.get("job_id") == job_id]
+        items = items[-limit:]
+        rows = [
+            [
+                r.get("job_id", "?"),
+                # 显示 ISO 时间
+                __import__("datetime").datetime.fromtimestamp(r["ts"], tz=__import__("datetime").timezone.utc).isoformat()
+                if r.get("ts") else "?",
+                r.get("status", "?"),
+                (r.get("output", "") or "")[:60],
+            ]
+            for r in items
+        ]
+        cli_ctx.output.table(["job_id", "ts", "status", "output"], rows, title=f"run history ({len(items)})")
 
     return cr_app
 

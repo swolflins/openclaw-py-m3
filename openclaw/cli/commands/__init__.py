@@ -17,7 +17,7 @@ _COMMAND_MODULES = [
     "openclaw.cli.commands.config",
     "openclaw.cli.commands.models",
     "openclaw.cli.commands.run",
-    "openclaw.cli.commands.agent",
+    "openclaw.cli.commands.agents",
     "openclaw.cli.commands.sessions",
     "openclaw.cli.commands.channels",
     "openclaw.cli.commands.message",
@@ -33,6 +33,7 @@ _COMMAND_MODULES = [
     "openclaw.cli.commands.system",
     "openclaw.cli.commands.logs",
     "openclaw.cli.commands.sandbox",
+    "openclaw.cli.commands.update",
 ]
 
 

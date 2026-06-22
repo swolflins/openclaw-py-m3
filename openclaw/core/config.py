@@ -115,6 +115,8 @@ class ChannelRuntimeConfig(BaseModel):
     whatsapp: dict[str, Any] = Field(default_factory=dict)
     signal: dict[str, Any] = Field(default_factory=dict)
     imessage: dict[str, Any] = Field(default_factory=dict)
+    # Phase 26:channel 凭据落盘的根目录(login/logout/creds.json 用)
+    fs_root: str = Field(default_factory=lambda: str(Path("~/.openclaw/channels").expanduser()))
 
 
 class AgentConfig(BaseModel):
@@ -162,6 +164,9 @@ class OpenClawConfig(BaseModel):
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     # ----- Phase 7 -----
     channels_runtime: ChannelRuntimeConfig = Field(default_factory=ChannelRuntimeConfig)
+
+    # ----- Phase 26:多 agent 配置(list[dict] 由 CLI 写/读) -----
+    agents: list[dict] = Field(default_factory=list)
 
     default_provider: Optional[str] = None
     router_fallback: list[str] = Field(default_factory=list)

@@ -142,6 +142,74 @@ def _gateway_app() -> typer.Typer:
                 results[path] = {"error": e.message}
         cli_ctx.output.print(results, title="status")
 
+    @gw_app.command("call")
+    def gateway_call(
+        ctx: typer.Context,
+        method: str = typer.Argument(..., help="RPC 方法名,如 'sessions.list' / 'agents.list'"),
+        params: Optional[str] = typer.Option(None, "--params", help="JSON 字符串参数(默认 '{}')"),
+        url: Optional[str] = typer.Option(None, "--url"),
+        token: Optional[str] = typer.Option(None, "--token"),
+    ) -> None:
+        """直接调一个 Gateway RPC 方法(POST /v1/rpc)。"""
+        import json
+
+        cli_ctx = get_ctx(ctx.obj)
+        try:
+            params_obj = json.loads(params) if params else {}
+        except json.JSONDecodeError as e:
+            raise CLIError(f"params 不是合法 JSON: {e}", exit_code=2) from e
+
+        data = GatewayClient(url, token).post("/v1/rpc", json_body={"method": method, "params": params_obj})
+        cli_ctx.output.print(data, title=f"rpc {method}")
+
+    @gw_app.command("probe")
+    def gateway_probe(
+        ctx: typer.Context,
+        url: Optional[str] = typer.Option(None, "--url"),
+        token: Optional[str] = typer.Option(None, "--token"),
+        deep: bool = typer.Option(False, "--deep", help="深入探测(检查 channels / sessions 端点)"),
+    ) -> None:
+        """探测 gateway 可达性 + auth + 能力(不调 RPC,只打 GET)。"""
+        cli_ctx = get_ctx(ctx.obj)
+        client = GatewayClient(url, token, timeout=3.0)
+        results: dict = {"url": client.base_url}
+
+        # 1. 可达性
+        try:
+            client.get("/healthz")
+            results["reachable"] = True
+        except CLIError as e:
+            results["reachable"] = False
+            results["reachable_error"] = e.message
+            cli_ctx.output.print(results, title="probe")
+            return
+
+        # 2. auth 能力
+        try:
+            data = client.get("/version")
+            results["auth_ok"] = True
+            results["version"] = data.get("version", "?") if isinstance(data, dict) else data
+        except CLIError as e:
+            results["auth_ok"] = False
+            results["auth_error"] = e.message
+
+        # 3. 能力探测
+        if deep:
+            caps = {}
+            for ep, name in (
+                ("/v1/sessions", "sessions"),
+                ("/v1/channels", "channels"),
+                ("/v1/tools", "tools"),
+            ):
+                try:
+                    client.get(ep)
+                    caps[name] = "ok"
+                except CLIError as e:
+                    caps[name] = f"err: {e.message}"
+            results["endpoints"] = caps
+
+        cli_ctx.output.print(results, title="probe")
+
     return gw_app
 
 
