@@ -168,8 +168,33 @@ jobs:
           # smoke test 只验证 /healthz,用 OPENCLAW_GATEWAY_DEV=1 允许无 token 启动
           docker run -d --rm --name openclaw-ci -p 18080:8080 \
             -e OPENCLAW_GATEWAY_DEV=1 \
+            -e OPENCLAW_LOG_LEVEL=DEBUG \
             ghcr.io/${{ github.repository_owner }}/openclaw-py:dev
-          sleep 8
-          curl -fsS http://127.0.0.1:18080/healthz | tee /tmp/health.json
+
+          # 等待容器启动(最多 30 秒,每 2 秒探测一次)
+          ok=false
+          for i in $(seq 1 15); do
+            sleep 2
+            if curl -fsS http://127.0.0.1:18080/healthz > /tmp/health.json 2>/dev/null; then
+              ok=true
+              break
+            fi
+            echo "  attempt $i: not ready yet..."
+            # 检查容器是否已退出
+            if ! docker ps --filter name=openclaw-ci --filter status=running | grep -q openclaw-ci; then
+              echo "❌ 容器已退出,docker logs:"
+              docker logs openclaw-ci 2>&1 | tail -30
+              exit 1
+            fi
+          done
+
+          if [ "$ok" = false ]; then
+            echo "❌ 30 秒内 /healthz 未就绪,docker logs:"
+            docker logs openclaw-ci 2>&1 | tail -50
+            exit 1
+          fi
+
+          cat /tmp/health.json
           test "$(jq -r .status /tmp/health.json)" = "ok"
+          echo "✅ /healthz 返回 ok"
           docker stop openclaw-ci

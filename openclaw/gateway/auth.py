@@ -192,14 +192,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # 旧逻辑:仅当显式传 host="0.0.0.0" 才 fail-fast,但 uvicorn --host 0.0.0.0
         # 时 create_app() 不感知绑定地址,检查被绕过。
         # 新逻辑:无 token + 非 dev 模式 → 直接拒绝启动(不论 host)
-        if host is not None and host == "0.0.0.0" and not self._tokens:
-            raise RuntimeError(
-                "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
-                "为防止未鉴权部署,启动被拒绝。请设置: "
-                "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-            )
+        # 注意:dev 模式下允许 0.0.0.0 + 无 token(本地开发/Docker smoke test)
         if not self._tokens:
             if not is_dev_mode():
+                if host is not None and host == "0.0.0.0":
+                    raise RuntimeError(
+                        "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
+                        "为防止未鉴权部署,启动被拒绝。请设置: "
+                        "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+                        "\n  或本地开发:export OPENCLAW_GATEWAY_DEV=1"
+                    )
                 raise RuntimeError(
                     "[H1] OPENCLAW_GATEWAY_TOKEN 未设置且未显式开启 dev 模式。"
                     "为防止未鉴权部署,启动被拒绝。请执行以下任一操作:\n"

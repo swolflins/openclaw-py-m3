@@ -136,13 +136,19 @@ def _no_token(monkeypatch):
     monkeypatch.delenv("OPENCLAW_GATEWAY_TOKEN", raising=False)
     # 也不要让 OPENCLAW_GATEWAY_HOST 干扰(host 参数显式传)
     monkeypatch.delenv("OPENCLAW_GATEWAY_HOST", raising=False)
+    # H1 修复:conftest.py 的 autouse fixture 设了 OPENCLAW_GATEWAY_DEV=1
+    # 默认保留 dev 模式(127.0.0.1 测试需要它);fail-fast 测试单独删
 
 
 # -------- 1) host=0.0.0.0 + no token → RuntimeError --------
 
-def test_create_app_failfast_when_0_0_0_0_without_token(deps, _no_token):
-    """0.0.0.0 + 无 token 视为生产部署,启动期必须 fail-fast。"""
+def test_create_app_failfast_when_0_0_0_0_without_token(deps, _no_token, monkeypatch):
+    """0.0.0.0 + 无 token + 非 dev 模式 → 启动期必须 fail-fast。"""
+    # H1 修复:conftest.py 的 autouse fixture 设了 OPENCLAW_GATEWAY_DEV=1,需显式关闭
+    # 注意:必须先 import create_app(触发模块级 app=create_app()),
+    # 再删 OPENCLAW_GATEWAY_DEV,否则 import 时模块级 create_app() 会因 dev 关闭而失败
     from openclaw.gateway.app import create_app
+    monkeypatch.delenv("OPENCLAW_GATEWAY_DEV", raising=False)
     with pytest.raises(RuntimeError) as excinfo:
         create_app(deps=deps, host="0.0.0.0")
     # 错误信息要包含建议命令
@@ -190,8 +196,10 @@ def test_create_app_ok_when_0_0_0_0_with_token_but_rejects_unauth(deps, monkeypa
 
 # -------- 4) AuthMiddleware __init__ 直接校验(双层保险) --------
 
-def test_auth_middleware_init_raises_when_0_0_0_0_no_token():
+def test_auth_middleware_init_raises_when_0_0_0_0_no_token(monkeypatch):
     """Phase 25 双层保险:AuthMiddleware(host='0.0.0.0', tokens=[]) 必抛 RuntimeError。"""
+    # H1 修复:conftest.py 的 autouse fixture 设了 OPENCLAW_GATEWAY_DEV=1,需显式关闭
+    monkeypatch.delenv("OPENCLAW_GATEWAY_DEV", raising=False)
     from starlette.applications import Starlette
     from openclaw.gateway.auth import AuthMiddleware
     inner = Starlette()

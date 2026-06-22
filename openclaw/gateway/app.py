@@ -288,15 +288,17 @@ def create_app(
     # 0.0.0.0 视为对外暴露(类似 production),127.0.0.1 仍允许 dev。
     _host = host if host is not None else os.environ.get("OPENCLAW_GATEWAY_HOST", "127.0.0.1")
     _token_raw = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
-    if _host == "0.0.0.0" and not _token_raw:
-        raise RuntimeError(
-            "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
-            "为防止未鉴权部署,启动被拒绝。请设置: "
-            "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-        )
     # H1 修复:无 token + 非 dev 模式 → fail-closed(不论 host)
     # 防止 uvicorn --host 0.0.0.0 绕过上面的 host 检查
+    # 注意:dev 模式下允许 0.0.0.0 + 无 token(本地开发/Docker smoke test)
     if not _token_raw and not is_dev_mode():
+        if _host == "0.0.0.0":
+            raise RuntimeError(
+                "[Phase 25] 检测到 host=0.0.0.0 但 OPENCLAW_GATEWAY_TOKEN 未设置。"
+                "为防止未鉴权部署,启动被拒绝。请设置: "
+                "export OPENCLAW_GATEWAY_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+                "\n  或本地开发:export OPENCLAW_GATEWAY_DEV=1"
+            )
         raise RuntimeError(
             "[H1] OPENCLAW_GATEWAY_TOKEN 未设置且未显式开启 dev 模式。"
             "为防止未鉴权部署,启动被拒绝。请执行以下任一操作:\n"
