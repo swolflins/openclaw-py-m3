@@ -50,7 +50,11 @@ def _setup_logging() -> None:
 
 
 def _make_agent():
-    """根据 AGENT_BACKEND 选 agent,默认 echo。"""
+    """根据 AGENT_BACKEND 选 agent,默认 echo。
+
+    echo 模式:直接回复原文(验证 channel 通路)
+    openai/anthropic/gemini/ollama:接真 AgentLoop(llm + tools + memory + journal 全链路)
+    """
     backend = os.environ.get("AGENT_BACKEND", "echo").lower()
 
     if backend == "echo":
@@ -71,16 +75,68 @@ def _make_agent():
             def memory(self): return None
         return _Echo()
 
-    if backend in ("openai", "anthropic", "gemini", "ollama"):
-        print(
-            f"⚠️  AGENT_BACKEND={backend!r} 模式需要手动写 AgentLoop(provider=...)\n"
-            "   (examples/lark_run.py 默认走 echo,够测试 channel 通路)\n"
-            "   编辑本文件,把 _make_agent() 里 backend=='echo' 那段换成你 provider 即可。",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+    if backend in ("openai", "anthropic", "gemini", "ollama", "deepseek"):
+        # 接真 AgentLoop:llm + tools + memory + journal
+        # 会真的读 OPENAI_API_KEY/ANTHROPIC_API_KEY/...,不阻塞 echo 模式
+        from openclaw.agent.loop import AgentLoop
+        from openclaw.providers.openai_compat import OpenAICompatProvider
+        from openclaw.providers.anthropic import AnthropicProvider
+        from openclaw.providers.gemini import GeminiProvider
+        from openclaw.tools.builtin import register_builtin_tools
 
-    print(f"❌ 未知 AGENT_BACKEND={backend!r}(echo/openai/anthropic/gemini/ollama)", file=sys.stderr)
+        backend_cfg = {
+            "openai":   ("OpenAI",  OpenAICompatProvider, "gpt-4o-mini", "https://api.openai.com/v1"),
+            "deepseek": ("DeepSeek", OpenAICompatProvider, "deepseek-chat", "https://api.deepseek.com/v1"),
+            "ollama":   ("Ollama",  OpenAICompatProvider, "qwen2.5:7b", "http://127.0.0.1:11434/v1"),
+            "anthropic":("Anthropic", AnthropicProvider, "claude-haiku-4-5", None),
+            "gemini":   ("Gemini", GeminiProvider, "gemini-2.0-flash", None),
+        }[backend]
+
+        name, ProviderCls, default_model, default_url = backend_cfg
+        model = os.environ.get("AGENT_MODEL", default_model)
+        api_key = (
+            os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
+            or "ollama"  # ollama 不需要 key
+        )
+        print(f"🤖 启动 {name} provider,model={model}", file=sys.stderr)
+
+        if ProviderCls is OpenAICompatProvider:
+            llm = OpenAICompatProvider(
+                api_key=api_key,
+                base_url=os.environ.get("AGENT_BASE_URL", default_url),
+                model=model,
+            )
+        elif ProviderCls is AnthropicProvider:
+            llm = AnthropicProvider(api_key=api_key, model=model)
+        else:  # GeminiProvider
+            llm = GeminiProvider(api_key=api_key, model=model)
+
+        # 全链路需要 tools + memory
+        fs_root = os.environ.get("OPENCLAW_FS_ROOT", os.getcwd())
+        shell_cwd = os.environ.get("OPENCLAW_SHELL_CWD", os.getcwd())
+        tools = register_builtin_tools(fs_root=fs_root, shell_default_cwd=shell_cwd)
+        # 试启动 memory(失败时退回 None,AgentLoop 允许 tools=None/memory=None)
+        try:
+            from openclaw.memory import create_memory
+            memory = create_memory(backend=os.environ.get("OPENCLAW_MEMORY", "memory"))
+        except Exception as e:
+            print(f"⚠️  memory 启动失败,退回 None: {e}", file=sys.stderr)
+            memory = None
+
+        agent = AgentLoop(
+            llm=llm,
+            tools=tools,
+            memory=memory,
+            system_prompt=os.environ.get(
+                "AGENT_SYSTEM_PROMPT",
+                "你是一个简洁的中文助手,回答控制在 100 字以内。",
+            ),
+        )
+        return agent
+
+    print(f"❌ 未知 AGENT_BACKEND={backend!r}(echo/openai/anthropic/gemini/ollama/deepseek)", file=sys.stderr)
     sys.exit(2)
 
 
