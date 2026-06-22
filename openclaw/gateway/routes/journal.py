@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -34,41 +35,83 @@ def _journal() -> Any:
 async def list_entries(
     days: int = Query(7, ge=1, le=90, description="回看天数"),
 ) -> dict:
-    """列出最近 N 天的 journal entry 路径 + 摘要元数据。"""
+    """列出最近 N 天的 journal entry 路径 + 摘要元数据。
+
+    Phase 27 / M7 修复:把 ``fp.read_text`` 同步 I/O 走 ``asyncio.to_thread``,
+    防止大目录 / 慢磁盘场景下阻塞 event loop。
+    """
     j = _journal()
     since = datetime.now(timezone.utc) - timedelta(days=days)
     files = j.list_entries(since=since)
     out: list[dict] = []
-    for fp in files:
+
+    def _parse_one(fp: Path) -> dict:
         rel = str(fp.relative_to(j.root))
-        # 简单解析:从 md 文件头抓时间 / 迭代 / 标签
         text = fp.read_text(encoding="utf-8")
         meta = _parse_entry_meta(text)
         meta["path"] = rel
-        out.append(meta)
+        return meta
+
+    # 并发读(用 to_thread 释放 event loop);单文件 parse 仍顺序,IO 走线程
+    parsed = await asyncio.gather(*(asyncio.to_thread(_parse_one, fp) for fp in files))
+    out = list(parsed)
     return {"entries": out, "count": len(out)}
 
 
 @router.get("/entries/read")
 async def read_entry(path: str = Query(..., description="相对 path,如 2026-06-20/sess_xxx.md")) -> dict:
-    """读一个 entry 的完整内容(限制在 journal root 内,防越界)。"""
+    """读一个 entry 的完整内容(限制在 journal root 内,防越界)。
+
+    Phase 27 / C5 修复:用 ``Path.is_relative_to`` 替代 ``str.startswith`` 字符串拼接,
+    避免相对 root 时 ``str(full).startswith(str(root)+"/")`` 误判边界(case:
+    root="foo", full="foobar" 会被旧实现判成"越界"或"未越界"取决于边界 char)。
+
+    还加了三层加固:
+    1. 拒绝绝对路径(``path`` 以 ``/`` 起头会让 ``Path.__truediv__`` 替换 root)
+    2. 拒绝包含 NUL 字符
+    3. ``is_relative_to``(Python 3.9+)语义明确,无需手写边界拼接
+    """
     j = _journal()
+    if not path:
+        raise HTTPException(status_code=400, detail="path must be non-empty")
+    if "\x00" in path:
+        raise HTTPException(status_code=400, detail="path contains NUL character")
+    if path.startswith("/") or path.startswith("\\"):
+        raise HTTPException(
+            status_code=400,
+            detail="absolute path not allowed (use relative path under journal root)",
+        )
     full = (j.root / path).resolve()
     root_resolved = Path(j.root).resolve()
-    if not str(full).startswith(str(root_resolved) + "/") and full != root_resolved:
+    # Python 3.9+ 的 is_relative_to 比 str.startswith 更稳健:
+    # - 自动处理 root 末尾是否带分隔符
+    # - 跨平台(Windows 大小写不敏感)由 Path 自身负责
+    if not (full == root_resolved or full.is_relative_to(root_resolved)):
         raise HTTPException(status_code=400, detail="path escapes journal root")
     if not full.exists():
         raise HTTPException(status_code=404, detail="entry not found")
-    return {"path": path, "content": full.read_text(encoding="utf-8")}
+    # Phase 27 / M7:read_text 走 to_thread
+    content = await asyncio.to_thread(full.read_text, encoding="utf-8")
+    return {"path": path, "content": content}
 
 
 @router.post("/weekly")
 async def generate_weekly() -> dict:
-    """触发周报生成,返回文件路径 + 摘要。"""
+    """触发周报生成,返回文件路径 + 摘要。
+
+    Phase 27 follow-up / M16 修复:``j.weekly_report()`` 本身是同步(内部
+    跑 ``fp.read_text`` 拼字符串),在 threadpool / 慢磁盘 / 大量 entry 场景
+    下会阻塞 event loop。Phase 27 M7 已经把 ``read_text`` 单独包了
+    ``asyncio.to_thread``,但 weekly_report() 整体同步(读 N 个 entry + 解析
+    + 写 weekly_<x>.md)仍然阻塞。**修法**:整个调用包 ``asyncio.to_thread``,
+    让 weekly 报告在后台线程跑,event loop 立刻可以接下一个请求。
+    """
     j = _journal()
-    p = j.weekly_report()
+    p = await asyncio.to_thread(j.weekly_report)
     rel = str(p.relative_to(j.root))
-    return {"weekly_report": rel, "content": p.read_text(encoding="utf-8")[:2000]}
+    # Phase 27 / M7:read_text 走 to_thread
+    text = await asyncio.to_thread(p.read_text, encoding="utf-8")
+    return {"weekly_report": rel, "content": text[:2000]}
 
 
 @router.get("/soul-proposals")
@@ -84,7 +127,9 @@ async def read_soul_proposals() -> dict:
     p = j.root / "_soul_proposals.md"
     if not p.exists():
         return {"proposals": "", "exists": False}
-    return {"proposals": p.read_text(encoding="utf-8"), "exists": True}
+    # Phase 27 / M7:read_text 走 to_thread
+    text = await asyncio.to_thread(p.read_text, encoding="utf-8")
+    return {"proposals": text, "exists": True}
 
 
 def _parse_entry_meta(text: str) -> dict[str, Any]:

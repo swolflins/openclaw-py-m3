@@ -1,13 +1,32 @@
 """统一异常类型。"""
 from __future__ import annotations
 
+import os
+
 
 class OpenClawError(Exception):
     """所有 OpenClaw 异常的根。"""
 
 
 class ConfigError(OpenClawError):
-    """配置加载/校验失败。"""
+    """配置加载/校验失败。
+
+    Phase 27 follow-up / M18 修复:子类化时支持 ``path=`` 关键字,把出错的
+    配置文件路径(以及原始 message)一起塞到 ``__str__`` 里,便于排查。
+    ``str(exc)`` 拿到的格式:
+    - 有 path: ``[config: <path>] <原 message>``
+    - 无 path: ``<原 message>``(与原版完全一致,零回归)
+    """
+
+    def __init__(self, message: str, *, path: str | os.PathLike[str] | None = None) -> None:
+        super().__init__(message)
+        self.path = str(path) if path is not None else None
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        if self.path:
+            return f"[config: {self.path}] {base}"
+        return base
 
 
 class PluginError(OpenClawError):

@@ -124,6 +124,8 @@ def test_production_mode_requires_token(monkeypatch):
     """NEW-1:OPENCLAW_GATEWAY_ENV=production 且无 token → create_app 抛 RuntimeError。"""
     from openclaw.gateway import auth
 
+    # Phase 27 / M9:prod + dev=1 是矛盾,清掉 conftest autouse 注入
+    monkeypatch.delenv("OPENCLAW_GATEWAY_DEV", raising=False)
     # 清掉 token + 设 production
     monkeypatch.delenv("OPENCLAW_GATEWAY_TOKEN", raising=False)
     monkeypatch.setenv("OPENCLAW_GATEWAY_ENV", "production")
@@ -138,6 +140,9 @@ def test_production_mode_with_token_ok(monkeypatch):
     """NEW-1:production + 配 token → 不抛错,只是短 token 警告。"""
     from openclaw.gateway import auth
 
+    # Phase 27 / M9:prod + dev=1 是矛盾配置,测试需要先清掉 conftest autouse
+    # 设的 dev=1(测试装置的全局 dev 模式)
+    monkeypatch.delenv("OPENCLAW_GATEWAY_DEV", raising=False)
     monkeypatch.setenv("OPENCLAW_GATEWAY_ENV", "production")
     monkeypatch.setenv("OPENCLAW_GATEWAY_TOKEN", "x" * 40)
     auth.require_token_in_production()  # 不应抛

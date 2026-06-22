@@ -31,6 +31,12 @@ from openclaw.llm.base import (
 logger = get_logger(__name__)
 
 
+# Phase 27 follow-up / M4 修复:429 / 5xx 指数退避配置。
+# 长度 = 最大重试次数(3 次);每次重试前 sleep 的秒数。
+# 单元测试可以 monkeypatch ``_RETRY_BACKOFF`` 缩到 [0, 0, 0] 避免 3.5s 等待。
+_RETRY_BACKOFF: tuple[float, ...] = (0.5, 1.0, 2.0)
+
+
 class OpenAICompatProvider(BaseLLMProvider):
     """通用 OpenAI Chat Completions 客户端。"""
 
@@ -60,10 +66,17 @@ class OpenAICompatProvider(BaseLLMProvider):
             return self._client
         # 旧 loop 已销毁,或从未创建 → 重建
         if self._client is not None and not self._client.is_closed:
+            # Phase 27 / H1 修复:用 shield 防止外层 cancel 中断 aclose,避免
+            # 旧 client 半关半开(端口 / fd 泄露)。依然吞任何异常,但记 WARNING
+            # 方便诊断。
             try:
-                await self._client.aclose()
-            except Exception:
-                pass
+                await asyncio.shield(self._client.aclose())
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "openai_compat_aclose_failed",
+                    error_type=type(e).__name__,
+                    error_msg=str(e)[:200],
+                )
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=self.timeout,
@@ -101,19 +114,68 @@ class OpenAICompatProvider(BaseLLMProvider):
             payload["tool_choice"] = "auto"
 
         client = await self._get_client()
-        try:
-            resp = await client.post("/chat/completions", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPStatusError as e:
-            body = e.response.text if e.response else "<no body>"
-            raise ProviderError(
-                f"LLM 调用失败: HTTP {e.response.status_code if e.response else '?'} - {body[:500]}"
-            ) from e
-        except httpx.HTTPError as e:
-            raise ProviderError(f"LLM 网络错误: {e!r}") from e
-
-        return _parse_response(data)
+        # Phase 27 follow-up / M4 修复:429 / 5xx 走指数退避重试,最多 3 次。
+        # 退避间隔 0.5s / 1s / 2s(在 _RETRY_BACKOFF 里改)。其他错误(4xx except 429)
+        # 立即抛,避免对鉴权错误反复重试浪费配额。
+        last_exc: Optional[Exception] = None
+        for attempt in range(len(_RETRY_BACKOFF) + 1):
+            try:
+                resp = await client.post("/chat/completions", json=payload)
+                # 429 / 5xx 触发退避重试(走下面的 except)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"transient HTTP {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                # 4xx (非 429) → 用 raise_for_status 拿到原始 HTTPStatusError,
+                # 但**不**走到退避分支(否则会把 401 / 403 等鉴权错反复打 3 次)。
+                # 修法:把 status code < 500 且 != 429 的情况单独 raise 一个不同的异常类。
+                if resp.status_code >= 400:
+                    raise httpx.HTTPStatusError(
+                        f"non-retryable HTTP {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                data = resp.json()
+                return _parse_response(data)
+            except (httpx.HTTPStatusError, httpx.TransportError) as e:
+                last_exc = e
+                # 非可重试错误(4xx except 429)→ 立即抛,不走退避
+                if (
+                    isinstance(e, httpx.HTTPStatusError)
+                    and e.response is not None
+                    and not (e.response.status_code == 429 or e.response.status_code >= 500)
+                ):
+                    body = e.response.text if e.response else "<no body>"
+                    raise ProviderError(
+                        f"LLM 调用失败: HTTP {e.response.status_code} - {body[:500]}"
+                    ) from e
+                # 重试用尽 → 抛 ProviderError
+                if attempt >= len(_RETRY_BACKOFF):
+                    body = ""
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        body = e.response.text
+                    status = (
+                        e.response.status_code
+                        if isinstance(e, httpx.HTTPStatusError) and e.response is not None
+                        else "?"
+                    )
+                    raise ProviderError(
+                        f"LLM 调用失败(已重试 {attempt} 次): HTTP {status} - {body[:500]}"
+                    ) from e
+                # 还有预算:睡一下再重试
+                backoff = _RETRY_BACKOFF[attempt]
+                logger.warning(
+                    "openai_compat_retry",
+                    attempt=attempt + 1,
+                    backoff=backoff,
+                    error=type(e).__name__,
+                    error_msg=str(e)[:200],
+                )
+                await asyncio.sleep(backoff)
+        # 理论上 unreachable;留个兜底防 lint
+        raise ProviderError(f"LLM 调用失败: {last_exc!r}")
 
     # 给 router 提供重试入口
     acomplete_with_retry = acomplete

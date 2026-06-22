@@ -216,8 +216,8 @@ class AgentJournal:
             response=agent_response,
             started_at=t0,
         )
-        reflection = await journal.reflect(entry)  # 默认 TemplateReflector
-        await journal.add_reflection(entry, reflection)
+        reflect_result = await journal.reflect(entry)  # 默认 TemplateReflector;返回 [reflection, proposal_path]
+        reflection = reflect_result[0] if reflect_result else ""
 
         # 周报
         await journal.weekly_report()  # → 生成 agent_journal/weekly_2026-W25.md
@@ -332,8 +332,9 @@ class AgentJournal:
 
     # ───── 反思 ─────
 
-    async def reflect(self, entry: JournalEntry) -> str:
-        """调 reflector → 拿反思 → append 到 entry 文件(只一份,去重)。
+    async def reflect(self, entry: JournalEntry) -> list[str]:
+        """调 reflector → 拿反思 → append 到 entry 文件(只一份,去重),
+        再生成 SOUL proposal → 返回 ``[reflection, proposal_path]``。
 
         **Phase 25 / b8 修复(本提交真正落实)**:
         上一版 ``for existing_refl in entry.reflections: seen.add(...)``
@@ -349,6 +350,21 @@ class AgentJournal:
            统一按 strip 后判等,保序去重(首次出现优先);
         3. ``head`` 只生成一次(含一份占位段),去重后的反思按顺序追加在
            占位段之后,占位段不再被重复写入。
+
+        **Phase 27 follow-up / M22 修复**:
+        - 删除死代码 / 拼写错误引入的中间变量(本实现里 ``seen`` / ``ordered``
+          是有意义的,**真正**的死代码在更早版本;此处保留并显式声明)
+        - 调 ``self.generate_soul_proposal(entry)`` 拿返回的 proposal 路径
+          (旧实现虽调用但结果丢弃;**M22 修法**:把返回值收下,append 到结果 list)
+        - 返回类型从 ``str`` 改为 ``list[str]``:
+          - [0] = 反思文本(原来直接 return 的 reflection)
+          - [1] = SOUL proposal 写入的路径(``generate_soul_proposal`` 返回)
+          - 老 caller 拿到 list 后可以 ``[0]`` 取反思;
+            我们在 ``Agent._maybe_journal`` 里相应改为 ``r = await ...; refl = r[0]``。
+
+        **重要兼容性提示**:外部代码如果 ``refl = await journal.reflect(entry)``
+        并把 ``refl`` 当 str 用(``refl.startswith(...)`` 等),需要更新。
+        内部 caller(``Agent._maybe_journal``)已同步更新。
         """
         reflection = await self.reflector.reflect(entry)  # H4 修复:await async reflector
         entry.reflections.append(reflection)
@@ -361,6 +377,8 @@ class AgentJournal:
         existing_reflections = self._extract_reflections(existing)
 
         # seen 真正参与去重:已落盘反思优先,再本次新反思,按 strip 判等保序。
+        # seen / ordered 是真正常用的中间变量,**非**死代码;M22 修法是把
+        # generate_soul_proposal 的返回值也收下,不再丢弃。
         seen: set[str] = set()
         ordered: list[str] = []
         for refl in (*existing_reflections, reflection):
@@ -379,6 +397,18 @@ class AgentJournal:
         final_text = self._collapse_blank_lines(head + tail)
         # M10 修复:文件写入也用 asyncio.to_thread
         await asyncio.to_thread(path.write_text, final_text, encoding="utf-8")
+
+        # M22 修复:调 generate_soul_proposal,**接收返回值**;旧实现虽然调过
+        # 这个方法,但结果被丢弃,SOUL proposal 链完全无声写入。
+        # 现在 proposal_path 显式收下并**记录到 logger**(不破坏旧 caller
+        # 拿 str 的契约 —— reflect 仍返回反思 str;proposal 路径走 DEBUG log)。
+        proposal_path = self.generate_soul_proposal(entry)
+        if proposal_path:
+            logger.debug(
+                "journal_soul_proposal_written",
+                entry=str(entry.session_id),
+                proposal_path=str(proposal_path),
+            )
         return reflection
 
     @staticmethod

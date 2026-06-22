@@ -63,6 +63,10 @@ def require_token_in_production() -> None:
     """NEW-1:生产模式下,启动时若无 token 则**直接抛错,拒绝启动**。
 
     dev / test 模式下不抛错(只 warning),保持向后兼容。
+
+    Phase 27 / M9 修复:生产模式下同时设了 ``OPENCLAW_GATEWAY_DEV=1`` → 阻断。
+    这是明显的"生产忘删 dev 开关"配置错误,会让鉴权全关。阻断在 token 检查之后,
+    保证只有"既 prod 又 dev"这一矛盾组合才报错。
     """
     if not is_production_mode():
         return
@@ -77,6 +81,13 @@ def require_token_in_production() -> None:
         # 太短的 token 即使配置了也警告,但不阻断(避免误杀)
         logger.warning(
             "gateway_token_too_short:检测到生产环境 token 长度 < 16,建议改用 secrets.token_urlsafe(32)"
+        )
+    # M9 修复:prod + dev=1 矛盾组合 → 阻断
+    if is_dev_mode():
+        raise RuntimeError(
+            f"[M9] {_ENV_VAR}=production 与 {_DEV_ENV}=1 同时设置 —— 鉴权将被关闭。"
+            "这是生产忘删 dev 开关的常见配置错误,启动被拒绝。"
+            "请删除 {_DEV_ENV}=1 或将 {_ENV_VAR} 改为 dev / staging。"
         )
 
 
@@ -226,8 +237,19 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 _USER_ID_ENV, _TOKEN_TO_USER_ENV,
             )
         if self._tokens and not self._user_id and not self._token_to_user:
-            # 仍走 token[:16] fallback —— 提醒运维:这是轮换不稳定的,生产应改用
-            # OPENCLAW_GATEWAY_USER_ID(单用户)或 OPENCLAW_GATEWAY_TOKEN_TO_USER(多用户)。
+            # Phase 27 / H3 修复:prod 模式 + 有 token + 缺 user_id + 缺 token_to_user
+            # → 启动期直接阻断,防止 per-user 隔离蒸发(token 轮换会换 user_id)。
+            # dev 模式仍走 warning,只提示不阻断(本地开发 / 烟测)。
+            if is_production_mode():
+                raise RuntimeError(
+                    "[H3] 生产模式下未配置 OPENCLAW_GATEWAY_USER_ID(单用户)"
+                    " 或 OPENCLAW_GATEWAY_TOKEN_TO_USER(多用户),"
+                    "per-user 隔离将依赖 token[:16] fallback —— token 轮换会导致"
+                    "memory / sessions 切换用户。请设置: \n"
+                    "  单用户:export OPENCLAW_GATEWAY_USER_ID=alice\n"
+                    "  多用户:export OPENCLAW_GATEWAY_TOKEN_TO_USER='{\"tk1\":\"alice\",\"tk2\":\"bob\"}'"
+                )
+            # dev / 未知模式:仍走 token[:16] fallback —— 提醒运维
             logger.warning(
                 "gateway_user_id_fallback_unstable:未配置 %s / %s,"
                 "user_id 退化为 token[:16] —— token 轮换会导致 memory/sessions 切换用户。"
@@ -273,7 +295,24 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         provided = _extract_token(request)
         if not provided or not _check_token(provided, self._tokens):
-            logger.info("gateway_auth_rejected", path=path, has_token=bool(provided))
+            # Phase 27 / M13 修复:升级到 warning 级 + 累计计数,便于暴力破解检测
+            # 与 SIEM 集成。保留原 INFO 字段(has_token)便于诊断。
+            try:
+                from openclaw.gateway import metrics as _gw_metrics
+
+                _gw_metrics.gateway_auth_rejected_total.labels(
+                    path=path,
+                    has_token=str(bool(provided)).lower(),
+                ).inc()
+            except Exception:  # pragma: no cover  # metrics 不可用时不阻断主流程
+                pass
+            logger.warning(
+                "gateway_auth_rejected",
+                path=path,
+                has_token=bool(provided),
+                # request_id 由 RequestIDMiddleware 写入 state(若已挂)
+                request_id=getattr(request.state, "request_id", None),
+            )
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 content={"detail": "missing or invalid gateway token"},

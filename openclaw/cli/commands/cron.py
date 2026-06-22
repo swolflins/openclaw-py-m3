@@ -30,6 +30,69 @@ _RUN_HISTORY: list[dict[str, Any]] = []
 _MAX_HISTORY = 100
 
 
+# Phase 27 / C3 修复:与 tools/builtin/shell.py 对齐的安全约束
+# 拒绝 shell 元字符与解释器黑名单(防 cron add -c 的 RCE 通道)
+_FORBIDDEN_METACHARS = ("&&", "||", ";", "|", "&", ">", "<", "`", "$(", "${", "\n", "\r")
+_INTERPRETER_BLACKLIST = {
+    "python", "python3", "python2", "sh", "bash", "zsh",
+    "perl", "ruby", "node", "nodejs", "lua", "php",
+}
+_MAX_COMMAND_LEN = 4096  # 长度上限防 OOM / log 注入
+
+
+def _validate_command(command: str) -> list[str]:
+    """校验 + 分词,失败抛 CLIError(CONFIG=2);返回 shlex 分词后的 argv 列表。
+
+    行为:
+    - 拒绝空命令 / 长度超限
+    - 拒绝换行 / 回车
+    - 拒绝 shell 元字符(&&, ||, ;, |, &, >, <, `, $(, ${)
+    - 拒绝解释器黑名单(python/sh/bash/... 防 -c 注入)
+    - POSIX 走 shlex.split(posix=True);Windows 走 posix=False(路径安全)
+    """
+    import shlex
+    import sys
+
+    if not command or not command.strip():
+        raise CLIError("command 为空", exit_code=2)
+    if len(command) > _MAX_COMMAND_LEN:
+        raise CLIError(
+            f"command 长度 {len(command)} 超过上限 {_MAX_COMMAND_LEN}",
+            exit_code=2,
+        )
+    if "\n" in command or "\r" in command:
+        raise CLIError("command 含换行/回车(防 multi-line 注入)", exit_code=2)
+    for ch in _FORBIDDEN_METACHARS:
+        if ch in command:
+            raise CLIError(
+                f"shell metachar {ch!r} 不允许(请把命令包成可执行脚本路径)",
+                exit_code=2,
+            )
+    posix = sys.platform != "win32"
+    try:
+        args = shlex.split(command, posix=posix)
+    except ValueError as e:
+        # POSIX 失败时 Windows 走 fallback
+        if posix:
+            try:
+                args = shlex.split(command, posix=False)
+            except ValueError as e2:
+                raise CLIError(f"无法解析 command: {e2}", exit_code=2) from e2
+        else:
+            raise CLIError(f"无法解析 command: {e}", exit_code=2) from e
+    if not args:
+        raise CLIError("command 解析后为空", exit_code=2)
+    import os
+    first_tok = os.path.basename(args[0])
+    if first_tok.lower() in _INTERPRETER_BLACKLIST:
+        raise CLIError(
+            f"解释器 {first_tok!r} 不允许(可经 -c/-e 注入任意代码;"
+            f"请用编译后的脚本路径)",
+            exit_code=2,
+        )
+    return args
+
+
 def _record_run(jid: str, status: str, output: str) -> None:
     import time as _time
     _RUN_HISTORY.append({
@@ -72,22 +135,30 @@ def _cron_app() -> typer.Typer:
     def cron_add(
         ctx: typer.Context,
         expr: str = typer.Option(..., "--expr", "-e", help="cron 表达式,如 '*/5 * * * *'"),
-        command: str = typer.Option(..., "--command", "-c", help="要执行的 shell 命令"),
+        command: str = typer.Option(..., "--command", "-c", help="要执行的命令(已 shlex 分词,无 shell 解释)"),
         name: Optional[str] = typer.Option(None, "--name", help="任务名(备注)"),
     ) -> None:
-        """添加 cron 任务(执行 shell 命令)。
+        """添加 cron 任务(执行命令)。
 
         注意:此为简化版,任务在当前进程内调度。要持久化需配合 gateway 长驻。
+
+        Phase 27 / C3 修复:不再用 ``shell=True``(会被 RCE)。改为 ``subprocess.run(args, shell=False)``,
+        command 必须可被 shlex 解析且不含 shell 元字符 / 解释器黑名单。
         """
         cli_ctx = get_ctx(ctx.obj)
         mgr = _mgr()
+        # 校验并分词;失败抛 CLIError(2)
+        argv = _validate_command(command)
 
         def _run():
             try:
-                proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+                # SEC-3 / Phase 27 / C3:shell=False + argv 列表,杜绝 shell 注入
+                proc = subprocess.run(
+                    argv, shell=False, capture_output=True, text=True, timeout=60,
+                )
                 _record_run(jid, "ok" if proc.returncode == 0 else "fail", proc.stdout + proc.stderr)
             except subprocess.TimeoutExpired:
-                _record_run(jid, "timeout", "shell command timed out (60s)")
+                _record_run(jid, "timeout", "command timed out (60s)")
 
         jid = mgr.add_cron(expr, _run)
         cli_ctx.output.success(f"已添加 cron 任务: {jid} (expr={expr})")

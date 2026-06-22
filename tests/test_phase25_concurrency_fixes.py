@@ -444,6 +444,8 @@ def test_smoke_all_three_fixes_coexist():
             response=resp,
         )
         out = asyncio.run(j.reflect(e))
+        # Phase 27 follow-up / M22 修复:reflect 仍返回反思文本 str
+        # (proposal 路径走 logger.debug 记录)
         assert "反思" in out
     finally:
         if smoke_root.exists():

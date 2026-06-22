@@ -121,6 +121,13 @@ tool_calls_total = _Counter(
     "工具调用总数(按 tool name / approved 分桶)",
     labelnames=("tool", "approved"),
 )
+# Phase 27 / M13 修复:网关鉴权失败指标(按 path / has_token 分桶),
+# 便于 SIEM 拉取数据检测暴力破解(同 IP / path 短时间内大量 has_token=false 即报警)
+gateway_auth_rejected_total = _Counter(
+    "openclaw_gateway_auth_rejected_total",
+    "网关鉴权失败总数(按 path / has_token 分桶)",
+    labelnames=("path", "has_token"),
+)
 
 uptime_seconds = _Gauge(
     "openclaw_uptime_seconds",
@@ -136,6 +143,7 @@ ALL_METRICS = [
     chat_total,
     chat_errors_total,
     tool_calls_total,
+    gateway_auth_rejected_total,
     uptime_seconds,
     agent_attached,
 ]

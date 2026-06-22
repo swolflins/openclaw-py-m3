@@ -182,15 +182,30 @@ class ChannelManager:
         return list(self._channels)
 
     async def start_all(self) -> None:
-        """启动所有 channel,直到 stop_all() 被调用。"""
+        """启动所有 channel,直到 stop_all() 被调用。
+
+        Phase 27 / M11 修复:``return_exceptions=True`` —— 任意一个 channel 启动失败
+        不再让整个 manager 崩溃(原 ``return_exceptions=False`` 会把首个异常 re-raise,
+        其他仍运行的 channel 无人 await)。改为收集每个 channel 的异常 + 打印后让 manager
+        继续,运维可在 ``channels list`` 看到失败的 channel 状态。
+        """
         if not self._channels:
             logger.warning("no channels registered, manager exits immediately")
             return
         tasks = [asyncio.create_task(ch.start(), name=f"ch-{ch.name}") for ch in self._channels]
-        try:
-            await asyncio.gather(*tasks, return_exceptions=False)
-        except asyncio.CancelledError:
-            pass
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # 报告失败的 channel(但不 re-raise,让 manager 继续运行)
+        for ch, res in zip(self._channels, results):
+            if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
+                logger.error(
+                    "channel_start_failed",
+                    channel=ch.name,
+                    error_type=type(res).__name__,
+                    error_msg=str(res)[:200],
+                )
+        # 注意:start() 通常是"永久循环"型(挂起到 stop),因此 gather 不会自然返回;
+        # 上面这段主要捕获"启动期就 raise"的 channel(配置错、依赖缺失等)。
+        # 当 stop_all() 触发 CancelledError 时,本函数会通过 CancelledError 退出。
 
     async def stop_all(self) -> None:
         for ch in self._channels:

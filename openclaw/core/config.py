@@ -191,9 +191,9 @@ class ConfigLoader:
             cfg = OpenClawConfig()
             if self.path and self.path.exists():
                 raw = self._read_file(self.path)
-                cfg = self._merge_env(OpenClawConfig.model_validate(raw))
+                cfg = ConfigLoader.merge_with_env(OpenClawConfig.model_validate(raw))
             else:
-                cfg = self._merge_env(cfg)
+                cfg = ConfigLoader.merge_with_env(cfg)
             self._config = cfg
             return cfg
 
@@ -234,19 +234,30 @@ class ConfigLoader:
         elif suffix == ".toml":
             data = tomllib.loads(text)
         else:
-            raise ConfigError(f"unsupported config format: {suffix}")
+            # Phase 27 follow-up / M18:把 path 一起传进去,str(exc) 即可看到
+            # 出错的配置文件,方便排查
+            raise ConfigError(f"unsupported config format: {suffix}", path=p)
         # SEC-4:支持 ${ENV_VAR} 插值(防泄漏明文 secret)
         return _interp_env(data)
 
-    @staticmethod
-    def _merge_env(cfg: OpenClawConfig) -> OpenClawConfig:
+    @classmethod
+    def merge_with_env(cls, cfg: "OpenClawConfig") -> "OpenClawConfig":
         """环境变量覆盖:OPENCLAW_<KEY>__<SUB>__<KEY>
 
         例: OPENCLAW_AGENT__SYSTEM_PROMPT="..."
             OPENCLAW_LOGGING__LEVEL=DEBUG
+
+        Phase 27 / C4 修复:
+        旧的 ``cfg.model_dump()`` 路径会把 ``SecretStr`` 序列化为 ``"**********"`` 占位符,
+        再 ``model_validate`` 时真值已丢失,生产部署 yaml + env 注入路径下会触发
+        鉴权静默失败。修法:用 ``model_dump(mode="python")`` 保留 Python 对象引用,
+        在 deep_merge 阶段手动跳过 secret 字段(避免占位符覆盖原值),并允许
+        ``OPENCLAW_<PATH>`` 显式覆盖 secret 字段(走 SecretStr 真值注入)。
         """
-        data = cfg.model_dump()
-        _deep_merge(data, _env_to_dict("OPENCLAW_"))
+        # mode="python" 保留 SecretStr 引用(而非 dump 成 "**********" 占位符)
+        data = cfg.model_dump(mode="python")
+        env_overlay = _env_to_dict("OPENCLAW_")
+        _deep_merge_secretsafe(data, env_overlay)
         return OpenClawConfig.model_validate(data)
 
 
@@ -308,6 +319,55 @@ def _deep_merge(dst: dict[str, Any], src: dict[str, Any]) -> None:
             _deep_merge(dst[k], v)
         else:
             dst[k] = v
+
+
+# Phase 27 / C4:SecretStr 安全版 deep_merge。
+# 跳过空字符串覆盖(常见占位符 ""/None 会把 SecretStr 误清空);
+# 保留 SecretStr 真值,只有当 env 显式提供新值时才替换。
+_SECRET_FIELD_NAMES = frozenset({
+    "api_key", "app_secret", "secret_key", "encrypt_key",
+    "verification_token", "password", "token",
+})
+
+
+def _deep_merge_secretsafe(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    """类似 ``_deep_merge`` 但对 secret 字段(以 _SECRET_FIELD_NAMES 匹配 key)做保护:
+
+    1. 若 dst[k] 已经是 SecretStr 且 src[k] 是空字符串 / None → 跳过(不覆盖)
+    2. 若 dst[k] 是 SecretStr 且 src[k] 是非空 str → 用 SecretStr(src[k]) 替换
+    3. 其他情况走标准 deep_merge
+    """
+    from pydantic import SecretStr
+
+    for k, v in src.items():
+        # 递归 dict
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge_secretsafe(dst[k], v)
+            continue
+
+        # secret 字段保护
+        if k.lower() in _SECRET_FIELD_NAMES:
+            existing = dst.get(k)
+            # 1) 已存在 SecretStr,env 给空 → 跳过
+            if isinstance(existing, SecretStr) and (v is None or v == ""):
+                continue
+            # 2) 已存在 SecretStr,env 给非空 → 真值覆盖
+            if isinstance(existing, SecretStr) and isinstance(v, str) and v:
+                dst[k] = SecretStr(v)
+                continue
+            # 3) 其他情况(无现有 / 非 SecretStr / 非 str 覆盖)
+            if v is None or v == "":
+                # 空值不引入新 SecretStr,直接跳过
+                continue
+            if isinstance(v, str):
+                dst[k] = SecretStr(v)
+                continue
+            # 非 str 真值 → 走普通赋值(让 pydantic 校验报错)
+            dst[k] = v
+            continue
+
+        # 非 secret 字段走标准语义
+        dst[k] = v
 
 
 # ------------------- 热重载 -------------------

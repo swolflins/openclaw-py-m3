@@ -40,13 +40,37 @@ def _get_message_store() -> MessageStore:
 
     设计:挂在 extra dict 上,不污染 GatewayDeps dataclass schema;
     同 process 内 gateway 实例共享一份。
+
+    Phase 27 / M6 修复:用 ``threading.Lock`` 保护 lazy init,防止多线程 / 高并发下
+    出现"两个 request 同时看到 ms is None,都新建 MessageStore,后写覆盖先写"的竞态。
+    asyncio 层面同一 event loop 是单线程,但 ``MessageStore`` 的内部 lock 可能在
+    跨 loop / 跨 thread 时被误用(测试中用 ``run_in_threadpool`` 调度时),加锁保
+    健壮性。**性能**:lock 只在"首次 init"路径上取,后续路径走 lock 内的 fastpath
+    (几乎无竞争)。
     """
+    import threading
     deps = get_deps()
-    ms = deps.extra.get("message_store") if isinstance(deps.extra, dict) else None
-    if ms is None:
-        ms = MessageStore()
-        if isinstance(deps.extra, dict):
-            deps.extra["message_store"] = ms
+    extra = deps.extra if isinstance(deps.extra, dict) else None
+    if extra is None:
+        # deps.extra 被外部改坏了 / 不是 dict,回退到顶层字段(Phase 27 / M6 加固)
+        if not hasattr(deps, "_ms_lock"):
+            deps._ms_lock = threading.Lock()
+        with deps._ms_lock:
+            ms = getattr(deps, "_ms_fallback", None)
+            if ms is None:
+                ms = MessageStore()
+                deps._ms_fallback = ms
+        return ms
+    if "message_store" in extra:
+        return extra["message_store"]
+    # 首次 init:加锁防并发
+    if not hasattr(deps, "_ms_lock"):
+        deps._ms_lock = threading.Lock()
+    with deps._ms_lock:
+        ms = extra.get("message_store")
+        if ms is None:
+            ms = MessageStore()
+            extra["message_store"] = ms
     return ms
 
 
@@ -81,6 +105,56 @@ class ChatResponse(BaseModel):
     )
 
 
+# Phase 27 follow-up / M14 修复:把 ``chat`` 和 ``chat_stream`` 共享的
+# 4 步业务(user 存 store → handle → assistant 存 store → count_replies)
+# 抽到 helper ``_process_chat_turn``。两个 endpoint 都调它,行为保持一致,
+# 不再"一改全改两处",reply_count / message_id 等字段也保证一致。
+# 失败处理依然在调用方;helper 只负责"成功路径",handle() 抛错时 helper
+# 会向上抛,外层 try/except 拿 request_id + 错误类型。
+async def _process_chat_turn(
+    req: "ChatRequest",
+    loop: Any,
+    ms: MessageStore,
+) -> tuple[Any, Any, Any, int]:
+    """执行一轮 chat 的 4 步共享业务。
+
+    Args:
+        req: 已经过 Pydantic 校验的 ChatRequest。
+        loop: ``deps.agent_loop``,可调 ``handle()``。
+        ms: ``MessageStore`` 单例。
+
+    Returns:
+        ``(user_msg, asst_msg, response, user_reply_count)`` 元组:
+        - ``user_msg`` / ``asst_msg``: StoredMessage,含 msg_id
+        - ``response``: ``AgentResponse``(含 content / iterations / tool_calls)
+        - ``user_reply_count``: user_msg 被 reply 了几次(>= 1,至少 asst 那条)
+
+    Raises:
+        上抛 ``loop.handle()`` 的任何异常,调用方负责脱敏 + 500。
+    """
+    # 1) user 消息入库(作为 thread 锚点)
+    user_msg = await ms.add(
+        session_id=req.session_id,
+        role="user",
+        content=req.message,
+        parent_id=req.reply_to_id,
+    )
+    # 2) agent handle
+    response = await loop.handle(req.session_id, req.message)
+    # 3) assistant 消息入库,parent_id = user_msg.msg_id
+    asst_msg = await ms.add(
+        session_id=req.session_id,
+        role="assistant",
+        content=response.content or "",
+        parent_id=user_msg.msg_id,
+        iterations=response.iterations,
+        tool_calls_count=len(response.tool_calls or []),
+    )
+    # 4) 数 user 消息被 reply 了几次
+    user_reply_count = await ms.count_replies(req.session_id, user_msg.msg_id)
+    return user_msg, asst_msg, response, user_reply_count
+
+
 @router.post("", response_model=ChatResponse)
 async def chat(req: ChatRequest, request: Request) -> ChatResponse:
     deps = get_deps()
@@ -94,14 +168,8 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
     request_id = getattr(request.state, "request_id", None) or uuid.uuid4().hex[:12]
     ms = _get_message_store()
     try:
-        # Phase 23:先把 user 消息存到 store(用作 thread 根)
-        user_msg = await ms.add(
-            session_id=req.session_id,
-            role="user",
-            content=req.message,
-            parent_id=req.reply_to_id,  # client 告诉我这条是 reply 哪条
-        )
-        resp = await loop.handle(req.session_id, req.message)
+        # Phase 27 follow-up / M14:统一走 _process_chat_turn helper
+        user_msg, asst_msg, resp, user_reply_count = await _process_chat_turn(req, loop, ms)
     except Exception as e:
         m.chat_errors_total.inc(error_type=type(e).__name__)
         # SEC-11 修复:不暴露 str(e),只给 request_id;完整 trace 写到 server log
@@ -119,18 +187,6 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
                 "type": type(e).__name__,
             },
         )
-
-    # Phase 23:存 assistant 消息,parent_id = 触发的 user 消息 id
-    asst_msg = await ms.add(
-        session_id=req.session_id,
-        role="assistant",
-        content=resp.content or "",
-        parent_id=user_msg.msg_id,  # ← assistant 是 user 消息的 reply
-        iterations=resp.iterations,
-        tool_calls_count=len(resp.tool_calls or []),
-    )
-    # 数 user 消息被 reply 了几次(飞书"1 条回复"那个数字)
-    user_reply_count = await ms.count_replies(req.session_id, user_msg.msg_id)
 
     return ChatResponse(
         session_id=req.session_id,

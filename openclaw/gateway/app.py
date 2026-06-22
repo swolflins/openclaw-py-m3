@@ -4,6 +4,12 @@
 - 全局限流中间件:对 ``/v1/chat`` / ``/v1/chat/stream`` 走 RateLimiter(默认 1 req/s burst=3)
 - Metrics middleware:用 FastAPI route template(``/v1/chat/{id}``)而非 raw URL,降基数
 - Request-ID 中间件:每个请求生成短 id,所有异常 handler 共享
+
+**Phase 27 / C1 修复**:
+``create_app`` 的 ``rate_limiter`` 默认值从 ``type(...)``(ellipsis 类型对象,
+仅作为哨兵)改为模块级 ``_DEFAULT_RATE_LIMITER`` 哨兵对象 + 独立
+``use_default_rate_limiter: bool`` 开关。消除"用类型对象作 sentinel"的反模式
+与"RateLimiter | None | type(...)"异质联合类型告警。
 """
 from __future__ import annotations
 
@@ -31,7 +37,25 @@ logger = get_logger(__name__)
 _RL_RATE = float(os.environ.get("OPENCLAW_GATEWAY_RL_RATE", "1.0"))
 _RL_BURST = int(os.environ.get("OPENCLAW_GATEWAY_RL_BURST", "3"))
 _RL_ENABLED = os.environ.get("OPENCLAW_GATEWAY_RL_DISABLED", "").lower() not in ("1", "true", "yes")
-_RATE_LIMITER = RateLimiter(rate=_RL_RATE, burst=_RL_BURST) if _RL_ENABLED else None
+_RATE_LIMITER: RateLimiter | None = RateLimiter(rate=_RL_RATE, burst=_RL_BURST) if _RL_ENABLED else None
+
+
+# Phase 27 / C1:独立 sentinel 对象,替代 type(...) 哨兵。
+class _DefaultRateLimiterSentinel:
+    """占位符:表示 ``create_app`` 走 module-level 默认限流单例。
+
+    用类对象(而非 ``...`` / ``Ellipsis``)作 sentinel 可以让签名表达为
+    ``RateLimiter | None | _DefaultRateLimiterSentinel``,避免 ``type(...)``
+    这种"类型对象作值"的反模式 + 异质联合告警。
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return "<DEFAULT_RATE_LIMITER>"
+
+
+_DEFAULT_RATE_LIMITER = _DefaultRateLimiterSentinel()
 
 # 需要限流的路径前缀
 _LIMITED_PREFIXES = ("/v1/chat", "/v1/channels/send")
@@ -263,15 +287,17 @@ def _resolve_cors_origin_regex() -> str:
 def create_app(
     deps: GatewayDeps | None = None,
     *,
-    rate_limiter: RateLimiter | None | type(...) = ...,  # ... = use default
+    rate_limiter: RateLimiter | None | _DefaultRateLimiterSentinel = _DEFAULT_RATE_LIMITER,
     host: str | None = None,
 ) -> FastAPI:
     """工厂函数:可以注入自定义 deps(测试用)。
 
-    ``rate_limiter`` 控制限流中间件行为:
+    ``rate_limiter`` 控制限流中间件行为(Phase 27 / C1 修复):
+    - 不传 / 传 ``_DEFAULT_RATE_LIMITER`` 哨兵 → 走 module-level 单例(env 控制)
     - 传 ``None`` → 关掉限流(测试/本地开发)
     - 传 ``RateLimiter`` 实例 → 用这个 limiter
-    - 不传 / 传 Ellipsis → 走 module-level 单例(env 控制)
+
+    旧的 ``type(...)`` 默认值哨兵已弃用,签名不再含异质联合告警。
 
     ``host``(Phase 25):显式传入监听地址 — 0.0.0.0 + 无 token 视为生产部署,
     启动期 fail-fast。默认从 ``OPENCLAW_GATEWAY_HOST`` env 读;测试可显式传。
@@ -336,8 +362,8 @@ def create_app(
     from openclaw.gateway.auth import install_auth
     # 启动期已 fail-fast,这里把 host 透传给 AuthMiddleware 做双层保险
     install_auth(app, host=_host)
-    # 限流:用户显式 None 关掉;否则走 module-level 单例
-    rl = _RATE_LIMITER if rate_limiter is ... else rate_limiter
+    # 限流:用户显式 None 关掉;否则走 module-level 单例(Phase 27 / C1:用 sentinel 类判断)
+    rl = _RATE_LIMITER if isinstance(rate_limiter, _DefaultRateLimiterSentinel) else rate_limiter
     if rl is None:
         # 传 None 时挂一个 None 限流的 middleware(等同禁掉)
         app.add_middleware(RateLimitMiddleware, rate_limiter=None)
@@ -376,22 +402,27 @@ def create_app(
     app.include_router(channels.router, prefix="/v1")
     app.include_router(journal.router, prefix="/v1")
 
-    # 静态 Web UI(挂在 /ui)
+    # Phase 27 / C2 修复:root_index 路由从 if 块内提升到顶层(无论 static_dir 是否存在),
+    # 避免"启动即确定"原则被破坏。/ui mount 仍保留 try/except 保护。
     from fastapi.staticfiles import StaticFiles
     from pathlib import Path
+
     static_dir = Path(__file__).resolve().parent / "static"
     if static_dir.exists():
-        app.mount("/ui", StaticFiles(directory=str(static_dir), html=True), name="ui")
+        try:
+            app.mount("/ui", StaticFiles(directory=str(static_dir), html=True), name="ui")
+        except Exception as e:  # pragma: no cover  # 防御性:StaticFiles 不应 fail
+            logger.warning("static_files_mount_failed", error=str(e))
 
-        @app.get("/", include_in_schema=False)
-        async def root_index() -> dict:
-            return {
-                "name": "openclaw-gateway",
-                "version": "0.1.0",
-                "ui": "/ui/",
-                "docs": "/docs",
-                "healthz": "/healthz",
-            }
+    @app.get("/", include_in_schema=False)
+    async def root_index() -> dict:
+        return {
+            "name": "openclaw-gateway",
+            "version": "0.1.0",
+            "ui": "/ui/",
+            "docs": "/docs",
+            "healthz": "/healthz",
+        }
 
     return app
 

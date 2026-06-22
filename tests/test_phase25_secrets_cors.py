@@ -291,8 +291,12 @@ def test_cors_disallowed_in_prod(deps, monkeypatch):
 
     prod 启动要求 token,先设上;然后校验 CORS 头为空。
     """
+    # Phase 27 / M9:prod + dev=1 是矛盾,清掉 conftest autouse 注入
+    monkeypatch.delenv("OPENCLAW_GATEWAY_DEV", raising=False)
     monkeypatch.setenv("OPENCLAW_GATEWAY_ENV", "production")
     monkeypatch.setenv("OPENCLAW_GATEWAY_TOKEN", "phase25-cors-prod-test-32chars-please-ignore")
+    # Phase 27 / H3:prod 模式必须有 user_id 或 token_to_user 之一
+    monkeypatch.setenv("OPENCLAW_GATEWAY_USER_ID", "tester")
     from openclaw.gateway.app import create_app
 
     app = create_app(deps=deps, host="127.0.0.1")
@@ -326,8 +330,12 @@ def test_cors_explicit_origins_env_var(deps, _dev_mode, monkeypatch):
 
 def test_docs_disabled_in_production(deps, monkeypatch):
     """prod 模式 GET /docs → 404(``app.docs_url=None``),``/redoc`` / ``/openapi.json`` 同理。"""
+    # Phase 27 / M9:prod + dev=1 是矛盾,清掉 conftest autouse 注入
+    monkeypatch.delenv("OPENCLAW_GATEWAY_DEV", raising=False)
     monkeypatch.setenv("OPENCLAW_GATEWAY_ENV", "production")
     monkeypatch.setenv("OPENCLAW_GATEWAY_TOKEN", "phase25-docs-prod-test-32chars-please-ignore")
+    # Phase 27 / H3:prod 模式必须有 user_id 或 token_to_user 之一(防 token 轮换换 user)
+    monkeypatch.setenv("OPENCLAW_GATEWAY_USER_ID", "tester")
     from openclaw.gateway.app import create_app
 
     app = create_app(deps=deps, host="127.0.0.1")
