@@ -39,6 +39,13 @@ class LarkSettings(BaseSettings):
     # Phase 31:持久化去重 state 的路径(显式传参优先,其次 env,最后默认)。
     # 设为 "" 时退化为 in-memory(适合测试)。
     dedup_path: Optional[str] = Field(default=None)
+    # Phase 32:Webhook 监听配置(use_ws=False 时生效)。
+    # host=127.0.0.1 / 0.0.0.0 + port + path 都可改;通过代理在公网时配 webhook_url 即可。
+    webhook_host: str = Field(default="0.0.0.0", description="Webhook 绑定地址")
+    webhook_port: int = Field(default=9000, ge=1, le=65535)
+    webhook_path: str = Field(default="/lark/webhook")
+    # Phase 32:入站媒体缓存目录;空字符串 = 关闭媒体下载(默认开启)。
+    media_dir: Optional[str] = Field(default=None)
 
 
 class AgentSettings(BaseSettings):

@@ -525,14 +525,24 @@ class TestFWebhookSecurity:
         ) is False
 
     def test_webhook_mode_still_raises(self, tmp_dedup_path, clean_lark_env):
-        """LARK_USE_WS=False 仍 NotImplementedError(等后续 Phase 加 aiohttp)。"""
-        ch = _make_lark(clean_lark_env, tmp_dedup_path)
-        ch.settings = MagicMock()
-        ch.settings.app_id = "cli_test"
-        ch.settings.app_secret = _real_secret("sec")
-        ch.settings.use_ws = False
-        ch._fetch_bot_open_id = AsyncMock()  # type: ignore[method-assign]
-        with pytest.raises(NotImplementedError, match="Webhook"):
+        """LARK_USE_WS=False 缺少 verification_token → RuntimeError(Phase 32 强校验)。
+
+        走真实 ``LarkSettings``,verification_token=None → 阻断。
+        """
+        from openclaw.config.settings import LarkSettings
+        from openclaw.agent.loop import AgentLoop  # type: ignore
+        from openclaw.channels.lark import LarkChannel
+
+        s = LarkSettings(
+            app_id="cli_test",
+            app_secret=_real_secret("sec"),
+            use_ws=False,
+            verification_token=None,  # 显式 None → 阻断
+            dedup_path=str(tmp_dedup_path),
+        )
+        loop = MagicMock(spec=AgentLoop)
+        ch = LarkChannel(loop, s)
+        with pytest.raises(RuntimeError, match="VERIFICATION_TOKEN"):
             asyncio.run(ch.start())
 
 
@@ -808,7 +818,7 @@ class TestIIntegrationHandleEvent:
         assert order == ["enter_m1", "exit_m1", "enter_m2", "exit_m2"]
 
     def test_empty_text_dispatches_nothing(self, tmp_dedup_path, clean_lark_env):
-        """text 解析后为空 → 不 dispatch(原本就有这逻辑,回归测试)。"""
+        """空文本(非媒体类型)→ 不 dispatch(原本就有这逻辑,回归测试)。"""
         ch = _make_lark(clean_lark_env, tmp_dedup_path)
         ch._bot_open_id = "ou_bot"
         dispatched: list[str] = []
@@ -819,6 +829,7 @@ class TestIIntegrationHandleEvent:
         ch.dispatch = fake_dispatch  # type: ignore[method-assign]
         evt = self._make_evt(message_id="om_e1", open_id="ou_a", chat_id="oc_c1", text="")
         asyncio.run(ch._handle_event(evt))
+        # 非媒体类型且 text 为空 → Phase 32 仍早退(媒体占位仅在媒体类型时填)
         assert dispatched == []
 
 

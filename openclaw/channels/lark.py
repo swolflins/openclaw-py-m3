@@ -86,6 +86,24 @@ WEBHOOK_ANOMALY_THRESHOLD = 25
 REACTION_IN_PROGRESS = "Typing"
 REACTION_FAILURE = "CrossMark"
 
+# Phase 32:Webhook 安全/限制配置(从 settings.webhook_* 字段读,缺省用这里)
+WEBHOOK_DEFAULT_HOST = "0.0.0.0"
+WEBHOOK_DEFAULT_PORT = 9000
+WEBHOOK_DEFAULT_PATH = "/lark/webhook"
+WEBHOOK_MAX_BODY_BYTES = 1 * 1024 * 1024          # 1 MiB
+WEBHOOK_BODY_TIMEOUT_SECONDS = 5
+WEBHOOK_RATE_LIMIT_MAX = 60                      # 每窗口最大事件数
+WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = 60           # 滑动窗口
+WEBHOOK_RATE_LIMIT_MAX_KEYS = 1000               # 不同 IP 计数上限
+
+# Phase 32:入站媒体缓存(图片/文件/音频)。目录可被 OPENCLAW_LARK_MEDIA_DIR 覆盖。
+LARK_MEDIA_DEFAULT_DIR = "~/.openclaw/lark_media"
+LARK_MEDIA_MAX_BYTES = 50 * 1024 * 1024          # 50 MiB 单文件上限
+LARK_MEDIA_CACHE_TTL_SECONDS = 7 * 24 * 3600     # 7 天过期
+
+# 入站媒体文件类型(基于 message_type 字段)
+LARK_MEDIA_TYPES = {"image", "file", "audio", "media", "video"}
+
 
 def _is_bot_mentioned(mentions: Optional[list], bot_open_id: Optional[str]) -> bool:
     """CH-1:判断飞书事件里是否 @ 了 bot。
@@ -219,6 +237,39 @@ def verify_webhook_signature(
     return hmac.compare_digest(digest, str(provided_signature))
 
 
+# ─────────────────────── Phase 32 媒体下载辅助(同步) ───────────────────────
+
+def _stream_to_file_sync(
+    target_path_str: str,
+    resp: Any,
+) -> Optional[int]:
+    """在 executor 线程里把 httpx 流响应写到磁盘。
+
+    超 ``LARK_MEDIA_MAX_BYTES`` → 中断并返回 ``None``(调用方视作失败)。
+    写完后 ``.tmp → .real`` 原子替换。
+
+    必须是同步函数 — 防止 ASYNC230(异步函数不应同步写文件)。
+    """
+    from pathlib import Path as _P
+    target = _P(target_path_str)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    written = 0
+    try:
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                written += len(chunk)
+                if written > LARK_MEDIA_MAX_BYTES:
+                    f.close()
+                    tmp.unlink(missing_ok=True)
+                    return None
+                f.write(chunk)
+        tmp.replace(target)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return written
+
+
 try:  # 飞书 SDK 可选依赖
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
@@ -277,6 +328,25 @@ class LarkChannel(BaseChannel):
         if self._allowed_users:
             logger.info("Lark 启动:LARK_ALLOWED_USERS=%d 个 open_id", len(self._allowed_users))
         logger.info("Lark 启动:group_policy=%s", self._group_policy)
+        # Phase 32:入站媒体缓存目录(空字符串 = 关闭)。
+        md = getattr(settings, "media_dir", None) if settings is not None else None
+        if md == "":
+            self._media_dir: Optional[Path] = None
+        else:
+            env_md = os.environ.get("OPENCLAW_LARK_MEDIA_DIR", "").strip()
+            default_md = env_md or LARK_MEDIA_DEFAULT_DIR
+            self._media_dir = Path(md or default_md).expanduser()
+            try:
+                self._media_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                logger.exception(
+                    "Lark 媒体目录创建失败: %s,媒体下载关闭", self._media_dir,
+                )
+                self._media_dir = None
+        # Phase 32:webhook 限流(per-key sliding window)
+        self._webhook_rate: dict[str, list[float]] = {}
+        # Phase 32:webhook runner 句柄(供 stop() 关闭)
+        self._webhook_runner: Optional[Any] = None
 
     # ---------- 公共接口 ----------
 
@@ -293,15 +363,32 @@ class LarkChannel(BaseChannel):
             raise RuntimeError("飞书凭据未配置 (LARK_APP_ID / LARK_APP_SECRET)")
 
         if not self.settings.use_ws:
-            # Phase 31 仍未实现完整 aiohttp 路由,但下面这些子模块已经就绪:
-            # - verify_webhook_token / verify_webhook_signature
-            # - record_webhook_anomaly / clear_webhook_anomaly
-            # 等后续 Phase 把 aiohttp app + URL verification 回调拼上即可启用。
-            raise NotImplementedError(
-                "Webhook 模式尚未实现,当前仅支持长连接模式(LARK_USE_WS=true)。"
-                "verification token / signature / anomaly tracker 子模块已就绪,"
-                "等 Webhook 路由落地。"
+            # Phase 32:Webhook 模式已落地。
+            # 必须配 LARK_VERIFICATION_TOKEN(Hermes 也强制,防伪造事件)。
+            if not self.settings.verification_token:
+                raise RuntimeError(
+                    "LARK_VERIFICATION_TOKEN 未配置,拒绝启动 Webhook 模式"
+                    "(防未鉴权公开端点被滥用)"
+                )
+            try:
+                import aiohttp  # noqa: F401  # 缺此包就 fail-fast
+            except Exception as e:
+                raise RuntimeError(
+                    f"aiohttp 未安装,无法启用 Webhook 模式:`pip install aiohttp` ({e})"
+                ) from e
+            # CH-1:启动期先 await 一次 bot_open_id(@ 检测需要)
+            try:
+                await self._fetch_bot_open_id()
+            except RuntimeError as e:
+                logger.warning("Lark 启动:bot_open_id 拉取失败(%s), @ 检测回退", e)
+            self._task = asyncio.create_task(self._webhook_loop())
+            logger.info(
+                "Lark Webhook 渠道已启动:host=%s port=%d path=%s",
+                self.settings.webhook_host, self.settings.webhook_port,
+                self.settings.webhook_path,
             )
+            await self._stopped.wait()
+            return
 
         # CH-1:启动期先 await 一次 bot_open_id(同步进 WS loop 之前)。
         try:
@@ -323,6 +410,14 @@ class LarkChannel(BaseChannel):
                 self._ws_client.stop()
             except Exception:
                 pass
+        # Phase 32:webhook runner 优雅关闭
+        runner = getattr(self, "_webhook_runner", None)
+        if runner is not None:
+            try:
+                await runner.cleanup()
+            except Exception:
+                logger.exception("Lark webhook runner cleanup 失败")
+            self._webhook_runner = None
         # Phase 31:退出时刷一次去重 state
         try:
             await self._persist_seen_message_ids_async()
@@ -644,6 +739,328 @@ class LarkChannel(BaseChannel):
             .build()
         )
 
+    # ---------- Phase 32: Webhook 模式(aiohttp) ----------
+
+    async def _webhook_loop(self) -> None:
+        """Phase 32:跑 aiohttp app,监听飞书 webhook 回调。
+
+        设计要点(参考 Hermes Feishu 4594-4608):
+        - 只用 aiohttp 一个进程内 server,不需要外部 nginx
+        - 路由: ``POST {LARK_WEBHOOK_PATH}`` → ``_handle_webhook_request``
+        - 关闭:由 ``stop()`` 调 ``runner.cleanup()``
+        """
+        from aiohttp import web  # type: ignore[import-untyped]
+
+        async def _handler(request: Any) -> Any:
+            try:
+                return await self._handle_webhook_request(request)
+            except Exception:
+                logger.exception("Lark webhook 顶层崩溃")
+                return web.json_response({"code": 500, "msg": "internal"}, status=500)
+
+        app = web.Application()
+        app.router.add_post(self.settings.webhook_path, _handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        self._webhook_runner = runner
+        site = web.TCPSite(runner, self.settings.webhook_host, self.settings.webhook_port)
+        await site.start()
+        try:
+            await self._stopped.wait()
+        finally:
+            try:
+                await runner.cleanup()
+            except Exception:
+                pass
+            self._webhook_runner = None
+
+    def _check_webhook_rate_limit(self, rate_key: str) -> bool:
+        """Phase 32:滑动窗口限流(per key)。
+
+        rate_key 形如 ``{app_id}:{path}:{remote_ip}``,跟 Hermes 对齐。
+        返回 True = 放行,False = 已超限。
+        """
+        now = time.time()
+        window = WEBHOOK_RATE_LIMIT_WINDOW_SECONDS
+        max_n = WEBHOOK_RATE_LIMIT_MAX
+        # 上限保护:超 keys 上限就驱逐最旧
+        if len(self._webhook_rate) >= WEBHOOK_RATE_LIMIT_MAX_KEYS:
+            oldest_key = next(iter(self._webhook_rate))
+            self._webhook_rate.pop(oldest_key, None)
+        bucket = self._webhook_rate.get(rate_key, [])
+        # 清理窗口外
+        cutoff = now - window
+        bucket = [t for t in bucket if t >= cutoff]
+        if len(bucket) >= max_n:
+            self._webhook_rate[rate_key] = bucket
+            return False
+        bucket.append(now)
+        self._webhook_rate[rate_key] = bucket
+        return True
+
+    async def _handle_webhook_request(self, request: Any) -> Any:
+        """Phase 32:处理一个飞书 webhook 回调。
+
+        守卫顺序(参考 Hermes 3329-3427):
+        1. 限流 → 429
+        2. Content-Type guard → 415
+        3. Content-Length guard → 413
+        4. body read with timeout → 408 / 400
+        5. JSON 解析 → 400
+        6. Verification token → 401-token
+        7. URL verification challenge → echo challenge
+        8. Signature (when encrypt_key set) → 401-sig
+        9. encrypt= → 400
+        10. clear_anomaly + dispatch by event_type
+        """
+        from aiohttp import web  # type: ignore[import-untyped]
+
+        remote_ip = (getattr(request, "remote", None) or "unknown")
+        rate_key = f"{self.settings.app_id}:{self.settings.webhook_path}:{remote_ip}"
+
+        # 1. 限流
+        if not self._check_webhook_rate_limit(rate_key):
+            logger.warning("Lark webhook 限流超限: %s", remote_ip)
+            record_webhook_anomaly(remote_ip, "429")
+            return web.Response(status=429, text="Too Many Requests")
+
+        # 2. Content-Type guard
+        headers = getattr(request, "headers", {}) or {}
+        content_type = str(headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+        if content_type and content_type != "application/json":
+            logger.warning(
+                "Lark webhook Content-Type 拒绝:%r from %s", content_type, remote_ip,
+            )
+            record_webhook_anomaly(remote_ip, "415")
+            return web.Response(status=415, text="Unsupported Media Type")
+
+        # 3. Content-Length guard
+        content_length = getattr(request, "content_length", None)
+        if content_length is not None and content_length > WEBHOOK_MAX_BODY_BYTES:
+            logger.warning(
+                "Lark webhook body 过大(Content-Length=%d) from %s",
+                content_length, remote_ip,
+            )
+            record_webhook_anomaly(remote_ip, "413")
+            return web.Response(status=413, text="Request body too large")
+
+        # 4. body read
+        try:
+            body_bytes: bytes = await asyncio.wait_for(
+                request.read(),
+                timeout=WEBHOOK_BODY_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Lark webhook body 读取超时 from %s", remote_ip)
+            record_webhook_anomaly(remote_ip, "408")
+            return web.Response(status=408, text="Request Timeout")
+        except Exception:
+            record_webhook_anomaly(remote_ip, "400")
+            return web.json_response({"code": 400, "msg": "failed to read body"}, status=400)
+
+        # 5. 实际 body 大小再次校验(防 Content-Length 撒谎)
+        if len(body_bytes) > WEBHOOK_MAX_BODY_BYTES:
+            logger.warning(
+                "Lark webhook body 实际过大(%d 字节) from %s",
+                len(body_bytes), remote_ip,
+            )
+            record_webhook_anomaly(remote_ip, "413")
+            return web.Response(status=413, text="Request body too large")
+
+        try:
+            payload = json.loads(body_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            record_webhook_anomaly(remote_ip, "400")
+            return web.json_response({"code": 400, "msg": "invalid json"}, status=400)
+
+        # 6. Verification token
+        if self.settings.verification_token:
+            header = payload.get("header") or {}
+            incoming_token = str(header.get("token") or payload.get("token") or "")
+            expected = self.settings.verification_token.get_secret_value()
+            if not verify_webhook_token(incoming_token, expected):
+                logger.warning("Lark webhook verification token 错 from %s", remote_ip)
+                record_webhook_anomaly(remote_ip, "401-token")
+                return web.Response(status=401, text="Invalid verification token")
+
+        # 7. URL verification challenge(必须在 token 校验之后!)
+        if payload.get("type") == "url_verification":
+            return web.json_response({"challenge": payload.get("challenge", "")})
+
+        # 8. Signature(配了 encrypt_key 才强制)
+        if self.settings.encrypt_key:
+            if not verify_webhook_signature(
+                timestamp=str(headers.get("x-lark-request-timestamp", "") or ""),
+                nonce=str(headers.get("x-lark-request-nonce", "") or ""),
+                body_str=body_bytes.decode("utf-8", errors="replace"),
+                encrypt_key=self.settings.encrypt_key.get_secret_value(),
+                provided_signature=str(headers.get("x-lark-signature", "") or ""),
+            ):
+                logger.warning("Lark webhook 签名错 from %s", remote_ip)
+                record_webhook_anomaly(remote_ip, "401-sig")
+                return web.Response(status=401, text="Invalid signature")
+
+        # 9. encrypt= 暂不支持
+        if payload.get("encrypt"):
+            record_webhook_anomaly(remote_ip, "400-encrypted")
+            return web.json_response(
+                {"code": 400, "msg": "encrypted webhook payloads are not supported"},
+                status=400,
+            )
+
+        # 10. clear anomaly + dispatch
+        clear_webhook_anomaly(remote_ip)
+        event_type = str((payload.get("header") or {}).get("event_type") or "")
+        await self._dispatch_webhook_event(event_type, payload)
+        return web.json_response({"code": 0, "msg": "ok"})
+
+    async def _dispatch_webhook_event(self, event_type: str, payload: Any) -> None:
+        """Phase 32:把 webhook 事件分发到与 WS 同一管道。
+
+        复用现有 _handle_event / _handle_reaction_event / _handle_card_action,
+        payload 已经被解析成 dict,lark-oapi 的 .event.sender/.event.message
+        用 SimpleNamespace 包一层即可。
+        """
+        from types import SimpleNamespace
+
+        def _wrap(obj: Any) -> Any:
+            """递归把 dict/list 包装成 SimpleNamespace,叶子保留原值。"""
+            if isinstance(obj, dict):
+                return SimpleNamespace(**{k: _wrap(v) for k, v in obj.items()})
+            if isinstance(obj, list):
+                return [_wrap(x) for x in obj]
+            return obj
+
+        event = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+        data = SimpleNamespace(event=_wrap(event)) if event else SimpleNamespace()
+
+        try:
+            if event_type == "im.message.receive_v1":
+                await self._handle_event(data)
+            elif event_type in {
+                "im.message.reaction.created_v1",
+                "im.message.reaction.deleted_v1",
+            }:
+                await self._handle_reaction_event(event_type, data)
+            elif event_type == "card.action.trigger":
+                await self._handle_card_action(data)
+            else:
+                logger.debug("Lark webhook 忽略未支持事件类型:%s", event_type or "unknown")
+        except Exception:
+            logger.exception("Lark webhook 事件分发失败: %s", event_type)
+
+    # ---------- 媒体下载(Phase 32) ----------
+
+    async def _download_inbound_media(
+        self,
+        message_id: str,
+        file_key: str,
+        *,
+        message_type: str = "file",
+    ) -> Optional[Path]:
+        """Phase 32:从飞书拉一张入站媒体,落盘到 ``self._media_dir``。
+
+        - 调用 ``im/v1/messages/:message_id/resources/:file_key``(GET)
+        - 失败 / 超 LARK_MEDIA_MAX_BYTES / 媒体目录关闭 → 返回 None
+        - 文件名 = ``{message_type}_{message_id}_{file_key}.{ext}``
+        - 落盘前 SSRF 防御:只有飞书官方域才允许
+
+        幂等:同 (message_id, file_key) 已有缓存 → 直接返回路径。
+        """
+        if not self._media_dir:
+            return None
+        if not message_id or not file_key:
+            return None
+        ext = self._guess_media_ext(message_type, file_key)
+        filename = f"{message_type}_{message_id}_{file_key}{ext}"
+        # 净化文件名
+        filename = "".join(c for c in filename if c.isalnum() or c in "._-") or f"media_{file_key}{ext}"
+        target = self._media_dir / filename
+        if target.exists() and target.stat().st_size > 0:
+            return target
+
+        import httpx
+
+        token = await self._get_tenant_token()
+        if not token:
+            logger.warning("Lark 媒体下载:拿不到 tenant_access_token")
+            return None
+
+        # 飞书资源 API:SSRF 防御只走 open.feishu.cn
+        url = (
+            f"https://open.feishu.cn/open-apis/im/v1/messages/"
+            f"{message_id}/resources/{file_key}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                async with client.stream(
+                    "GET", url,
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as resp:
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "Lark 媒体下载失败 http=%d message_id=%s key=%s",
+                            resp.status_code, message_id, file_key,
+                        )
+                        return None
+                    # 先读 size header 防超
+                    content_length_hdr = resp.headers.get("Content-Length")
+                    if content_length_hdr:
+                        try:
+                            if int(content_length_hdr) > LARK_MEDIA_MAX_BYTES:
+                                logger.warning(
+                                    "Lark 媒体过大(%s 字节),拒绝下载", content_length_hdr,
+                                )
+                                return None
+                        except ValueError:
+                            pass
+                    # 流式写 — 文件 IO 走 run_in_executor 避免阻塞事件循环
+                    loop = asyncio.get_running_loop()
+                    written = await loop.run_in_executor(
+                        None, _stream_to_file_sync, str(target), resp,
+                    )
+                    if written is None:
+                        # 中断(超 LARK_MEDIA_MAX_BYTES)
+                        return None
+            logger.info("Lark 媒体已下载:%s (%d 字节)", target, written)
+            return target
+        except Exception:
+            logger.exception(
+                "Lark 媒体下载异常 message_id=%s key=%s", message_id, file_key,
+            )
+            return None
+
+    @staticmethod
+    def _guess_media_ext(message_type: str, file_key: str) -> str:
+        """从 message_type 猜扩展名;file_key 结尾有 '.' 也直接取。"""
+        if "." in file_key:
+            ext = "." + file_key.rsplit(".", 1)[-1].lower()
+            if len(ext) <= 6 and ext.replace(".", "").isalnum():
+                return ext
+        return {
+            "image": ".jpg",
+            "audio": ".mp3",
+            "video": ".mp4",
+            "media": ".bin",
+        }.get(message_type, ".bin")
+
+    @staticmethod
+    def _extract_file_key(msg: Any) -> str:
+        """从飞书消息结构里抽 file_key / image_key 等。
+
+        ``content`` 是 ``{"image_key": "..."}`` / ``{"file_key": "...", "file_name": "..."}`` 形式。
+        返回空串表示没有可下载的 key。
+        """
+        try:
+            content = json.loads(getattr(msg, "content", "") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        for k in ("image_key", "file_key", "video_key", "audio_key", "media_key"):
+            v = content.get(k)
+            if isinstance(v, str) and v:
+                return v
+        return ""
+
     async def _handle_event(self, evt: Any) -> None:
         """处理一条飞书消息事件。Phase 31:加 allowlist / dedup / per-chat 锁 / reaction 钩子。"""
         try:
@@ -665,6 +1082,28 @@ class LarkChannel(BaseChannel):
                     f"lark:{chat_id}:{open_id}", reason,
                 )
                 return
+            # Phase 32:媒体类型 → 走 _download_inbound_media,把本地路径
+            # 塞 metadata,text 改占位符(避免空文本被早丢)。
+            # 即便下载失败,有 image_key/file_key 仍生成占位符让 agent 知晓。
+            media_paths: list[Path] = []
+            media_placeholders: list[str] = []
+            msg_type = getattr(msg, "message_type", "") or ""
+            if msg_type in LARK_MEDIA_TYPES:
+                file_key = self._extract_file_key(msg)
+                if file_key:
+                    local = await self._download_inbound_media(
+                        message_id, file_key, message_type=msg_type,
+                    )
+                    placeholder = f"[{msg_type}:{file_key}]"
+                    if local is not None:
+                        media_paths.append(local)
+                    media_placeholders.append(placeholder)
+            # 媒体占位符拼到 text(空 text 时用占位符;有 text 时追加)
+            if media_placeholders:
+                if text:
+                    text = text + "\n" + "\n".join(media_placeholders)
+                else:
+                    text = "\n".join(media_placeholders)
             if not text:
                 return
 
@@ -701,6 +1140,9 @@ class LarkChannel(BaseChannel):
                             "mentioned": mentioned,
                             "chat_id": chat_id,
                             "message_id": message_id,
+                            # Phase 32:媒体下载结果(本机绝对路径列表)
+                            "media_paths": [str(p) for p in media_paths],
+                            "media_type": msg_type if media_paths else None,
                         },
                     ))
                     # 成功 → 移除 Typing reaction
