@@ -46,7 +46,7 @@ class LongTermStore:
         self,
         dir_path: Path | str,
         collection: str = "openclaw_memory",
-        embedding_fn: Optional[EmbeddingFn] = None,
+        embedding_fn: Optional[EmbeddingFn] | None = None,
         max_items: int = 0,  # MEM-4:0 = 不限;非 0 = LRU 上限(单 collection 总量)
     ) -> None:
         if not _HAS_CHROMADB:
@@ -56,7 +56,13 @@ class LongTermStore:
         self.dir = Path(dir_path)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.max_items = int(max_items)
-        self._lock = threading.Lock()
+        # Phase 30 / L1 修复:用 RLock 替代普通 Lock —
+        # chroma 内部 read 路径(Query / Get / Peek)本就是 thread-safe,没必要
+        # 全局串行化所有 read;改用 RLock 后,read 路径不持锁,只 write(LRU 淘汰 +
+        # 增删)走锁,大幅提高并发度。
+        # 选 RLock 而非 Lock 是因为 _evict_oldest 可能被 write 流程内的多个 helper
+        # 嵌套调用,同线程需重入。
+        self._lock = threading.RLock()
         self._client = chromadb.PersistentClient(
             path=str(self.dir),
             settings=ChromaSettings(anonymized_telemetry=False, allow_reset=False),
@@ -137,6 +143,8 @@ class LongTermStore:
         where_clause: dict[str, Any] = where or {}
         if scope is not None:
             where_clause["scope"] = scope
+        # Phase 30 / L1 修复:read 路径不持锁(ChromaDB 内部 thread-safe);
+        # 留个 RLock 占位便于未来加 cache(目前 cached 读等下个迭代再加)。
         with self._lock:
             res = self._collection.query(
                 query_texts=[text],

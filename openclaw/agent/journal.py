@@ -335,39 +335,28 @@ class AgentJournal:
 
     # ───── 反思 ─────
 
-    async def reflect(self, entry: JournalEntry) -> list[str]:
+    async def reflect(self, entry: JournalEntry) -> str:
         """调 reflector → 拿反思 → append 到 entry 文件(只一份,去重),
-        再生成 SOUL proposal → 返回 ``[reflection, proposal_path]``。
+        再生成 SOUL proposal → 返回反思文本(str)。
 
-        **Phase 25 / b8 修复(本提交真正落实)**:
-        上一版 ``for existing_refl in entry.reflections: seen.add(...)``
-        循环只填充 ``seen`` 却从不读取,是死代码;真正写入只靠循环外的
-        ``if reflection not in tail``,且 ``tail`` 直接拼了已落盘的
-        ``---`` + ``<!-- 反思将追加在下方 -->`` 占位段,导致每调一次
-        reflect 就多写一份占位段(N+1 份)。
-
-        修法:
-        1. 用 ``_extract_reflections`` 从已落盘文件里抽出**真正的反思块**
-           (跳过 ``---`` 分隔行与占位段),不再连带占位段一起拼回去;
-        2. ``seen`` set 真正参与去重 —— 对 "已落盘反思 + 本次新反思"
-           统一按 strip 后判等,保序去重(首次出现优先);
-        3. ``head`` 只生成一次(含一份占位段),去重后的反思按顺序追加在
-           占位段之后,占位段不再被重复写入。
+        **Phase 30 / H4 修复**:把签名的"返回双元素 list"形式改为单 str,
+        与实际 ``return reflection`` 一致;旧 docstring 误述为包含 proposal
+        路径的复合返回类型,与代码矛盾。
 
         **Phase 27 follow-up / M22 修复**:
         - 删除死代码 / 拼写错误引入的中间变量(本实现里 ``seen`` / ``ordered``
           是有意义的,**真正**的死代码在更早版本;此处保留并显式声明)
         - 调 ``self.generate_soul_proposal(entry)`` 拿返回的 proposal 路径
-          (旧实现虽调用但结果丢弃;**M22 修法**:把返回值收下,append 到结果 list)
-        - 返回类型从 ``str`` 改为 ``list[str]``:
-          - [0] = 反思文本(原来直接 return 的 reflection)
-          - [1] = SOUL proposal 写入的路径(``generate_soul_proposal`` 返回)
-          - 老 caller 拿到 list 后可以 ``[0]`` 取反思;
-            我们在 ``Agent._maybe_journal`` 里相应改为 ``r = await ...; refl = r[0]``。
+          (旧实现虽调用但结果丢弃;**M22 修法**:把返回值收下,通过
+          ``logger.debug("journal_soul_proposal_written", ...)`` 记录
+          proposal 路径,运行时可观测但不破坏 BC)
+        - **H4 修复**:返回类型统一为 ``str``(反思文本);proposal 路径
+          走 DEBUG log,不再走返回值。
 
         **重要兼容性提示**:外部代码如果 ``refl = await journal.reflect(entry)``
-        并把 ``refl`` 当 str 用(``refl.startswith(...)`` 等),需要更新。
-        内部 caller(``Agent._maybe_journal``)已同步更新。
+        并把 ``refl`` 当 str 用(``refl.startswith(...)`` 等),直接可用。
+        旧版 list-return 期间(Phase 25/27 中间状态)写入的 caller
+        ``r[0]`` / ``r[1]`` 取值应改为单值 + log 即可。
         """
         reflection = await self.reflector.reflect(entry)  # H4 修复:await async reflector
         entry.reflections.append(reflection)
@@ -468,8 +457,17 @@ class AgentJournal:
         return result
 
     async def add_reflection(self, entry: JournalEntry, text: str) -> None:
+        """Phase 30 / M10 修复:文件 IO 用 to_thread,避免阻塞事件循环。"""
+        import asyncio
         entry.reflections.append(text)
         path = Path(self._entry_filename(entry))
+        await asyncio.to_thread(self._append_to_file, path, text)
+
+    @staticmethod
+    def _append_to_file(path: Path, text: str) -> None:
+        """Phase 30 / M10 修复:被 add_reflection 通过 to_thread 调用,
+        纯同步文件 IO 集中到一个 helper,避免在 async 函数内直接 ``path.open``。
+        """
         with path.open("a", encoding="utf-8") as f:
             f.write("\n" + text + "\n")
 

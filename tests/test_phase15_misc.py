@@ -95,7 +95,8 @@ class TestPluginManager:
             (Path(tmp) / "ok.py").write_text("def register(runtime):\n    runtime.custom['loaded'] = True\n")
             rt = Runtime()
             pm = PluginManager(rt)
-            count = pm.load_local(tmp)
+            # Phase 30 / M13 修复:tmp_path 不在白名单,测试用 _skip_allowlist=True 绕过
+            count = pm.load_local(tmp, _skip_allowlist=True)
             assert count == 1
             assert rt.custom.get("loaded") is True
             assert pm.loaded() == ["ok"]

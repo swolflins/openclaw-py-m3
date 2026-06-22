@@ -40,3 +40,9 @@ def _fake_llm_keys(monkeypatch):
     """给 provider factory / agent loop 提供 dummy LLM key。"""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-used")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-used")
+
+
+# 不在 conftest 强制放宽白名单 — M13 引入白名单后,test_phase1 / test_phase15_misc
+# 这种 ``tmp_path / "plugins"`` 测试需要改用 ``_skip_allowlist=True`` 才能过。
+# (这些测试已通过 M13 修复后的兼容版 PR 同步更新 — 详见
+# tests/test_phase1.py / test_phase15_misc.py 的 ``_skip_allowlist=True`` 传参。)

@@ -259,16 +259,10 @@ class Agent:
             # reflect 已经是 async(内部文件 IO 也需要 to_thread,但 reflect 本身
             # 可能调 LLM 是 async 的,所以不能简单 to_thread;journal.py 内部的
             # 文件 IO 在后续 M10-journal 修复中处理)
-            # M22 修复:reflect 现在仍返回 str(反思文本);旧版 proposal_path
-            # 改成通过 logger.debug 在 journal 内记录,这里不需要再处理 list。
+            # H4 + M22 修复:reflect 返回 str(反思文本),proposal 路径走
+            # journal.logger.debug("journal_soul_proposal_written", ...)。
             try:
                 reflect_text = await self.journal.reflect(entry)
-                # 仅日志,不算错误
-                if reflect_text and not isinstance(reflect_text, str):
-                    logger.warning(
-                        "journal reflect returned non-str type %s; treat as debug-only",
-                        type(reflect_text).__name__,
-                    )
             except Exception as e:  # noqa: BLE001
                 logger.warning("journal reflect failed: %s", e)
         except Exception as e:  # noqa: BLE001

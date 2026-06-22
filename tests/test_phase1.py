@@ -160,7 +160,8 @@ def test_local_plugin_loading(tmp_path: Path):
 
     rt = Runtime()
     pm = PluginManager(rt)
-    n = pm.load_local(plugin_dir)
+    # Phase 30 / M13 修复:tmp_path 不在白名单,测试用 _skip_allowlist=True 绕过
+    n = pm.load_local(plugin_dir, _skip_allowlist=True)
     assert n == 1
     assert rt.custom.get("hello_plugin") == "ok"
     assert "hello" in pm.loaded()

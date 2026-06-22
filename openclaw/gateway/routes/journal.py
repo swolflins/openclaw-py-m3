@@ -81,8 +81,8 @@ async def read_entry(path: str = Query(..., description="相对 path,如 2026-06
             status_code=400,
             detail="absolute path not allowed (use relative path under journal root)",
         )
-    full = (j.root / path).resolve()
-    root_resolved = Path(j.root).resolve()
+    full = await asyncio.to_thread(lambda: (j.root / path).resolve())
+    root_resolved = await asyncio.to_thread(lambda: Path(j.root).resolve())
     # Python 3.9+ 的 is_relative_to 比 str.startswith 更稳健:
     # - 自动处理 root 末尾是否带分隔符
     # - 跨平台(Windows 大小写不敏感)由 Path 自身负责

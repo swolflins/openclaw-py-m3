@@ -70,6 +70,13 @@ class RedisBus:
                 raise
 
         while True:
+            # Phase 30 / L3 修复:每个循环前尝试 XAUTOCLAIM 抢 stale 任务
+            # (idle > stale_idle_ms,默认 60s),把死掉的 consumer 的 PEL
+            # 任务转给当前 consumer。防止 consumer 进程崩了之后任务卡在 PEL。
+            try:
+                await self._reclaim_stale(stream, group, consumer, stale_idle_ms=60_000)
+            except Exception:
+                logger.exception("redis_bus_xautoclaim_failed", topic=topic)
             try:
                 res = await c.xreadgroup(
                     group, consumer, {stream: ">"},
@@ -92,7 +99,56 @@ class RedisBus:
                             "redis_bus_handler_error, NOT acked, will redeliver",
                             topic=topic, entry_id=entry_id,
                         )
-                        # 不 ack → pending,后续可 XCLAIM 重投
+                        # 不 ack → pending,后续可 XCLAIM / XAUTOCLAIM 重投
+
+    async def _reclaim_stale(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        *,
+        stale_idle_ms: int = 60_000,
+        count: int = 10,
+    ) -> int:
+        """Phase 30 / L3 修复:用 XAUTOCLAIM 把 dead consumer 的 PEL 任务
+        转给当前 consumer。返回重投的条目数。
+
+        用途:消费者进程 OOM kill / 死锁时,任务卡在它的 PEL;XAUTOCLAIM
+        把 idle > ``stale_idle_ms`` 的任务转给活着的人,避免"无人处理"。
+        """
+        c = await self._get()
+        try:
+            # XAUTOCLAIM key group consumer min-idle-time start [COUNT count] [JUSTID]
+            res = await c.xautoclaim(
+                stream, group, consumer, stale_idle_ms, "0-0", count=count,
+            )
+        except Exception:  # pragma: no cover
+            logger.exception("xautoclaim_call_failed", stream=stream)
+            return 0
+        # res = (next_cursor, claimed_entries, deleted_ids)
+        if not res:
+            return 0
+        claimed = res[1] if len(res) > 1 else []
+        if claimed:
+            logger.info(
+                "redis_bus_reclaimed_stale",
+                stream=stream, count=len(claimed),
+            )
+        return len(claimed) if claimed else 0
+
+    async def aclose(self) -> None:
+        """Phase 30 / L3 修复:优雅关闭,关掉底层 aioredis 客户端。
+
+        应用层应在 ``finally`` 块或 lifespan 退出时调本方法,
+        防 redis 连接泄漏(M11 graceful shutdown 链路需要这个)。
+        """
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:  # pragma: no cover
+                logger.exception("redis_bus_aclose_failed")
+            finally:
+                self._client = None
 
 
 def get_redis_bus(url: str = "redis://localhost:6379/0") -> Optional[RedisBus]:

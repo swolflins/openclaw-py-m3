@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata as importlib_metadata
 import inspect
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,65 @@ from openclaw.core.errors import PluginError
 from openclaw.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------- Phase 30 / M13 加载隔离 ----------------
+
+# 1 MiB 上限 — 防 10GB 文件被 exec_module 阻塞(RCE 攻击放大面)。
+_MAX_PLUGIN_BYTES = 1 * 1024 * 1024
+
+
+def _get_allowed_plugin_dirs() -> list[Path]:
+    """插件目录白名单(Phase 30 / M13)。
+
+    优先级:
+    1. 显式 ``OPENCLAW_PLUGIN_DIR`` env 目录(可多次 ``:`` 分隔,生产部署推荐)
+    2. ``~/.openclaw/plugins/``(用户主目录)
+    3. ``/etc/openclaw/plugins/``(系统级,只读)
+
+    任意一个匹配即放行;**完全不在白名单** → 不加载(日志 CRITICAL)。
+    """
+    roots: list[Path] = []
+    env = os.environ.get("OPENCLAW_PLUGIN_DIR", "").strip()
+    if env:
+        for p in env.split(":"):
+            try:
+                roots.append(Path(p).expanduser().resolve())
+            except (OSError, ValueError):
+                continue
+    home = Path.home() / ".openclaw" / "plugins"
+    if home.exists():
+        try:
+            roots.append(home.resolve())
+        except (OSError, ValueError):
+            pass
+    sys_root = Path("/etc/openclaw/plugins")
+    if sys_root.exists():
+        try:
+            roots.append(sys_root.resolve())
+        except (OSError, ValueError):
+            pass
+    return roots
+
+
+def _is_under_any(d: Path, allowed: list[Path]) -> bool:
+    """判断 ``d`` 是否是 ``allowed`` 中任一目录的子目录。
+
+    用途:Phase 30 / M13 目录白名单校验。
+    """
+    if not allowed:
+        return False
+    try:
+        d_resolved = d.resolve()
+    except (OSError, ValueError):
+        return False
+    for root in allowed:
+        try:
+            d_resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 # 4 类扩展点
 ENTRY_POINT_GROUPS = {
@@ -97,8 +157,23 @@ class PluginManager:
                 logger.exception("plugin_load_failed", plugin=ep.name)
         return count
 
-    def load_local(self, directory: Path | str) -> int:
-        """扫描目录里所有 .py 文件,执行其 module-level `register(runtime)`。"""
+    def load_local(self, directory: Path | str, *, _skip_allowlist: bool = False) -> int:
+        """扫描目录里所有 .py 文件,执行其 module-level `register(runtime)`。
+
+        **Phase 30 / M13 修复 — 加载隔离**:
+        1. **目录白名单** — 拒绝在白名单外的目录加载插件。
+           白名单:``~/.openclaw/plugins/``、``/etc/openclaw/plugins/``、
+           显式 ``OPENCLAW_PLUGIN_DIR`` env 目录。
+           防止攻击者把插件写到任意目录(如 ``/tmp/evil/``)后诱导加载。
+        2. **文件大小上限** — 单个 .py 插件不得超过 1 MiB(防 10GB 文件阻塞 exec_module)。
+        3. **owner 校验** — 文件 owner uid 必须 == 当前进程 euid(防同主机其他用户写入)。
+        4. **绝对路径** — ``Path(directory).resolve()`` 拿到绝对路径后再比对白名单。
+
+        ``_skip_allowlist``:仅供**测试**使用(``True`` 时跳过白名单校验)。
+        仓库里 ``test_phase1`` / ``test_phase15_misc`` 用 ``tmp_path`` 作
+        测试 plugin 目录,这类测试需要绕过白名单,但生产代码**不允许**
+        传 ``_skip_allowlist=True``(只接受 keyword-only 形式)。
+        """
         d = Path(directory).resolve()  # M13 修复:解析为绝对路径
         if not d.exists():
             return 0
@@ -106,9 +181,40 @@ class PluginManager:
         if not d.is_dir():
             logger.warning("local_plugin_path_not_dir: %s", d)
             return 0
+        # M13 / Phase 30:目录白名单校验(测试可通过 _skip_allowlist 绕过)
+        if not _skip_allowlist:
+            allowed_roots = _get_allowed_plugin_dirs()
+            if not _is_under_any(d, allowed_roots):
+                logger.critical(
+                    "local_plugin_path_not_in_allowlist: %s not under any of %s",
+                    d, allowed_roots,
+                )
+                return 0
         count = 0
         for path in sorted(d.glob("*.py")):
             if path.name.startswith("_"):
+                continue
+            # M13 / Phase 30:文件大小上限(1 MiB)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size > _MAX_PLUGIN_BYTES:
+                logger.warning(
+                    "local_plugin_too_large: %s (%d bytes, max %d)",
+                    path, size, _MAX_PLUGIN_BYTES,
+                )
+                continue
+            # M13 / Phase 30:owner 校验
+            try:
+                st = path.stat()
+                if st.st_uid != os.geteuid():
+                    logger.warning(
+                        "local_plugin_owner_mismatch: %s owner uid=%d, current euid=%d",
+                        path, st.st_uid, os.geteuid(),
+                    )
+                    continue
+            except OSError:
                 continue
             mod_name = f"_openclaw_local_plugin_{path.stem}"
             spec = importlib.util.spec_from_file_location(mod_name, path)  # type: ignore[attr-defined]
