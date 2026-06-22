@@ -1,0 +1,53 @@
+# MANIFEST.in — Phase 29 / L12 修复
+# sdist / wheel 打不进 setuptools 默认的 include 列表时,需要 MANIFEST.in 显式补
+# (egg-info SOURCES.txt 是从 MANIFEST.in + VCS 派生的)
+#
+# 仓库里这些文件 README 引用了,但 setup 默认不会带上,需要 include:
+
+# 顶层配置/文档
+include README.md
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SOUL.md
+include LICENSE
+include LICENSE.*  # 多种 license 文件名兜底
+include NOTICE
+
+# 大型配置示例(RUNNING 章节引用)
+include openclaw.agnes.yaml
+
+# 部署相关的 ops/ 目录(prometheus.yml)
+recursive-include ops *.yml *.yaml
+
+# 启动脚本(README 提到)
+include start_lark_sync.py
+
+# examples/ 整个目录(RUNNING 章节 / CONTRIBUTING 都引用)
+recursive-include examples *.py *.md
+
+# docs/ 整目录(贡献指引 / 部署文档)
+recursive-include docs *.md
+
+# skill 模板(SKILL.md / skill.py) — 已被 examples/skills 覆盖,但保留显式
+include *.md
+include *.txt
+include *.yaml
+include *.yml
+include *.json
+include *.toml
+
+# 排除 — 仓库内的 .pyc / 虚拟环境 / 临时文件
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *$py.class
+global-exclude .DS_Store
+global-exclude .git/
+global-exclude .venv/
+global-exclude venv/
+global-exclude node_modules/
+global-exclude .pytest_cache/
+global-exclude .mypy_cache/
+global-exclude .ruff_cache/
+global-exclude htmlcov/
+global-exclude coverage.xml
+global-exclude *.egg-info/

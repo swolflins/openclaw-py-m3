@@ -15,7 +15,9 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        # Phase 29 / L11 修复:加 Python 3.13(性能提升明显,TPYU/free-threaded 渐进成熟)
+        # 3.13 在 chromadb / apscheduler 上 wheel 已就绪(2024-10 后)
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4

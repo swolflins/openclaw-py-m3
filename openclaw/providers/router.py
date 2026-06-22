@@ -231,16 +231,23 @@ class ProviderRouter(BaseLLMProvider):
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         max_attempts_per_step: int = 1,
+        # M25 修复:retry budget — 总耗时上限,防雪崩(下游慢/全失败时不能无限重试)
+        # 默认 30s 与 review 建议对齐;单元测试可传 0 禁用超时(但仍受 attempts 约束)
+        max_total_seconds: float = 30.0,
     ) -> LLMResult:
         """在当前 router 排序下,每个 provider 内部再重试 max_attempts_per_step 次,
         再切下一个 provider。
 
         **RT-7 修复**:用 tenacity 实现指数退避重试;成功 → breaker reset,失败 → breaker 累计。
+        **Phase 29 / M25 修复**:加 ``stop_after_delay(max_total_seconds)`` 总耗时上限
+        + 退避 ``max=2.0``(原 1.0 略紧),防雪崩。
         """
         from tenacity import (
             AsyncRetrying,
             retry_if_exception_type,
             stop_after_attempt,
+            stop_after_delay,
+            stop_any,
             wait_exponential,
         )
 
@@ -255,9 +262,19 @@ class ProviderRouter(BaseLLMProvider):
             t0 = time.time()
             try:
                 # RT-7:tenacity 指数退避(0.1s, 0.2s, 0.4s…)
+                # M25:加 stop_after_delay 防雪崩;wait_exponential max=2 略宽于原 1.0
+                # stop_after_delay(0) 等效"不限时间",只在 max_total_seconds > 0 时生效
+                # 用 stop_any 组合 attempt + delay(任一先到就停)
+                if max_total_seconds > 0:
+                    stop = stop_any(
+                        stop_after_attempt(attempts),
+                        stop_after_delay(max_total_seconds),
+                    )
+                else:
+                    stop = stop_after_attempt(attempts)
                 async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(attempts),
-                    wait=wait_exponential(multiplier=0.1, max=1.0),
+                    stop=stop,
+                    wait=wait_exponential(multiplier=0.1, max=2.0),
                     retry=retry_if_exception_type(Exception),
                     reraise=True,
                 ):

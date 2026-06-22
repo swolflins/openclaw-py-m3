@@ -88,17 +88,40 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # **生产部署必须**设 ``OPENCLAW_GATEWAY_TRUSTED_PROXY=1`` 显式开启 XFF 解析,
         # 否则仍用 client.host(防止误信任伪造 XFF)。
         sid = self._resolve_client_id(request)
-        if not self._limiter.allow(sid):
-            retry = self._limiter.retry_after(sid)
+        # Phase 29 / L9 修复:用 try_consume 同时拿 (allowed, remaining, retry_after)
+        # 一次原子操作同时计算三项,避免 allow + retry_after 两次加锁的"非原子读"
+        # 内存版与 Redis 版都实现了 ``try_consume``(签名对齐)。
+        try:
+            allowed, remaining, retry = self._limiter.try_consume(sid)
+        except AttributeError:
+            # BC 兜底:旧实现(没 try_consume)走 allow + retry_after
+            allowed = self._limiter.allow(sid)
+            retry = self._limiter.retry_after(sid) if not allowed else 0.0
+            remaining = 0.0
+        if not allowed:
+            headers = {
+                "Retry-After": str(max(1, int(retry) + 1)),
+                # L9:标准 rate limit headers — 让客户端能感知配额状态
+                "X-RateLimit-Limit": str(int(self._limiter.burst)),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(max(1, int(retry) + 1)),
+            }
             return JSONResponse(
                 status_code=429,
                 content={
                     "error": "rate_limited",
                     "retry_after_seconds": round(retry, 3),
                 },
-                headers={"Retry-After": str(max(1, int(retry) + 1))},
+                headers=headers,
             )
-        return await call_next(request)
+        # 成功路径:把 X-RateLimit-* 透传到响应头,让客户端做退避
+        response = await call_next(request)
+        try:
+            response.headers["X-RateLimit-Limit"] = str(int(self._limiter.burst))
+            response.headers["X-RateLimit-Remaining"] = str(max(0, int(remaining)))
+        except Exception:  # pragma: no cover
+            logger.exception("rate_limit_headers_set_failed")
+        return response
 
     @staticmethod
     def _resolve_client_id(request) -> str:

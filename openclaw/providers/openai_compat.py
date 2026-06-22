@@ -46,12 +46,25 @@ class OpenAICompatProvider(BaseLLMProvider):
         base_url: str = "https://api.deepseek.com/v1",
         model: str = "deepseek-chat",
         timeout: float = 60.0,
+        # M26 修复:bulkhead — 每 provider 独立的 httpx 连接池,防 LLM 慢调用拖死客户端
+        # 默认与 httpx 默认一致(max_connections=100, keepalive=20),
+        # review 建议 20/5 更保守(LLM 长连接,不需要那么多并发)
+        max_connections: int = 20,
+        max_keepalive_connections: int = 5,
+        # M25 修复:retry budget — 总耗时上限,默认 30s,防雪崩
+        max_retry_seconds: float = 30.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(model=model, **kwargs)
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # M26:构造 Limits(per provider,per instance 隔离)
+        self._limits = httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive_connections,
+        )
+        self._max_retry_seconds = max_retry_seconds
         self._client: Optional[httpx.AsyncClient] = None
         # 记录 client 创建时所在的 event loop id,跨 asyncio.run() 跨边界时重建
         self._client_loop_id: Optional[int] = None
@@ -84,6 +97,7 @@ class OpenAICompatProvider(BaseLLMProvider):
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
+            limits=self._limits,  # M26:per-provider bulkhead
         )
         self._client_loop_id = current_loop_id
         return self._client
@@ -117,7 +131,10 @@ class OpenAICompatProvider(BaseLLMProvider):
         # Phase 27 follow-up / M4 修复:429 / 5xx 走指数退避重试,最多 3 次。
         # 退避间隔 0.5s / 1s / 2s(在 _RETRY_BACKOFF 里改)。其他错误(4xx except 429)
         # 立即抛,避免对鉴权错误反复重试浪费配额。
+        # Phase 29 / M25 修复:加 max_retry_seconds(默认 30s)总耗时上限,防雪崩。
+        import time as _time
         last_exc: Optional[Exception] = None
+        retry_started = _time.monotonic()
         for attempt in range(len(_RETRY_BACKOFF) + 1):
             try:
                 resp = await client.post("/chat/completions", json=payload)
@@ -150,6 +167,26 @@ class OpenAICompatProvider(BaseLLMProvider):
                     body = e.response.text if e.response else "<no body>"
                     raise ProviderError(
                         f"LLM 调用失败: HTTP {e.response.status_code} - {body[:500]}"
+                    ) from e
+                # M25:重试 budget 超时 → 立即抛(不等 attempts 用尽)
+                elapsed = _time.monotonic() - retry_started
+                if elapsed >= self._max_retry_seconds:
+                    body = ""
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        body = e.response.text
+                    status = (
+                        e.response.status_code
+                        if isinstance(e, httpx.HTTPStatusError) and e.response is not None
+                        else "?"
+                    )
+                    logger.warning(
+                        "openai_compat_retry_budget_exceeded",
+                        elapsed=round(elapsed, 3),
+                        max_retry_seconds=self._max_retry_seconds,
+                        attempt=attempt + 1,
+                    )
+                    raise ProviderError(
+                        f"LLM 调用失败(重试 budget 耗尽 {elapsed:.1f}s): HTTP {status} - {body[:500]}"
                     ) from e
                 # 重试用尽 → 抛 ProviderError
                 if attempt >= len(_RETRY_BACKOFF):
