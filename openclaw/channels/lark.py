@@ -312,13 +312,10 @@ def _stream_to_file_sync(
 
 try:  # 飞书 SDK 可选依赖
     import lark_oapi as lark
-    from lark_oapi.api.im.v1 import (
-        P2ImMessageReceiveV1,
-    )
 
     _HAS_LARK = True
 except Exception:  # pragma: no cover - 兼容未装 SDK
-    lark = None  # type: ignore[assignment]
+    lark = None
     _HAS_LARK = False
 
 

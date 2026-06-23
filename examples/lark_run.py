@@ -123,12 +123,15 @@ def _make_agent():
         register_builtin_tools(tools, fs_root=fs_root, shell_default_cwd=shell_cwd)
         # 试启动 memory(失败时退回 None,AgentLoop 允许 tools=None/memory=None)
         try:
+            import os as _os2
             from openclaw.memory.scoped import ScopedMemory
             from openclaw.memory.short_term import ShortTermStore
-            import os as _os2
-            _mem_dir = _os2.environ.get("OPENCLAW_MEMORY_DIR", "/tmp/openclaw_mem")
-            memory = ScopedMemory(short_term=ShortTermStore(_mem_dir))
-            print(f"memory started OK at {_mem_dir}")
+            memory = ScopedMemory(
+                short_term=ShortTermStore(
+                    _os2.environ.get("OPENCLAW_MEMORY_DIR", "/tmp/openclaw_mem")
+                )
+            )
+            print(f"memory started OK at {_os2.environ.get('OPENCLAW_MEMORY_DIR', '/tmp/openclaw_mem')}")
         except Exception as e:
             print(f"memory failed: {e}", file=sys.stderr)
             memory = None
