@@ -236,6 +236,46 @@ openclaw lark
 python examples/full_stack_demo.py
 ```
 
+### 4. CLI 命令参考
+
+安装后可直接用 `openclaw` 或 `python -m openclaw` 调用。全局选项:
+
+```bash
+openclaw --config openclaw.yaml --json --verbose <command>
+```
+
+| 命令 | 作用 |
+|------|------|
+| `version` / `-V` | 版本信息 |
+| `run` | 交互式 REPL |
+| `once` | 单次对话 |
+| `config get/set/validate/schema/file` | 配置查看、修改、校验、格式转换 |
+| `models list` | 列出可用模型与路由策略 |
+| `agents list/show/add/remove/run` | Agent 定义管理 |
+| `sessions list/show/remove/clear` | 会话管理 |
+| `channels list` | 渠道状态 |
+| `channels lark start/stop/status` | 飞书 WS 显式控制(Phase 34 暴露) |
+| `message send` | 通过指定渠道发送消息 |
+| `memory get/set/clear` | 记忆读写 |
+| `journal list/show/proposals` | 成长日志 |
+| `tools list/call` | 工具列表与调用 |
+| `skills list` | Skill 发现 |
+| `plugins list/install/uninstall/search` | 插件管理 |
+| `gateway serve/status/health` | Gateway 启停与健康检查 |
+| `status` | 聚合运行时状态(新增) |
+| `health` | 顶层健康检查(新增) |
+| `tasks list/show/add/done/delete` | 本地任务管理(新增) |
+| `secrets list/get/set/unset` | 本地 secret 管理(新增) |
+| `mcp serve/tools` | MCP SSE server(新增) |
+| `doctor` | 环境诊断 |
+| `security audit` | 安全审计 |
+| `cron list/add/edit/remove/enable/disable/run/runs` | 定时任务 |
+| `system` | 系统信息 |
+| `logs` | 日志查看 |
+| `sandbox` | Docker 沙箱 |
+| `update check/status` | 版本升级检查 |
+| `completion install` | Shell 补全 |
+
 ## SOUL 文档格式(兼容 TS 版)
 
 ```markdown

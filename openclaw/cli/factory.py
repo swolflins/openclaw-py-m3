@@ -73,7 +73,7 @@ def build_router(
 
     primary, fallbacks = built[0], built[1:]
     strategy = cfg.agent.router_strategy or "fallback_only"
-    return ProviderRouter(primary, fallbacks, strategy=strategy)
+    return ProviderRouter(primary, fallbacks, strategy=strategy)  # type: ignore[arg-type]
 
 
 def build_memory(cfg: OpenClawConfig):

@@ -9,13 +9,16 @@
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_NOT_FOUND
+from openclaw.cli.errors import EXIT_NOT_FOUND, CLIError
+
+logger = logging.getLogger(__name__)
 
 
 def _find_log_files(cli_ctx) -> list[Path]:
@@ -27,8 +30,8 @@ def _find_log_files(cli_ctx) -> list[Path]:
         cfg, _ = load_config(cli_ctx.config_path)
         candidates.append(cfg.memory.dir / "openclaw.log")
         candidates.append(cfg.memory.dir / "logs" / "openclaw.log")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("加载配置以定位日志文件失败: %s", exc)
     candidates.append(Path("openclaw.log"))
     candidates.append(Path("logs/openclaw.log"))
     candidates.append(Path("/tmp/openclaw.log"))

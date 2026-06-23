@@ -16,7 +16,7 @@ from typing import Optional
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_DEPENDENCY
+from openclaw.cli.errors import EXIT_DEPENDENCY, CLIError
 from openclaw.cli.factory import build_agent_loop, load_config
 from openclaw.cli.http import GatewayClient
 
@@ -50,8 +50,8 @@ def _do_serve(ctx: typer.Context, host: Optional[str], port: Optional[int], relo
 
     h, p = _resolve_host_port(cli_ctx, host, port)
 
-    from openclaw.gateway.deps import GatewayDeps, set_deps
     from openclaw.gateway.app import create_app  # 只 import 函数,不 import 模块级 app
+    from openclaw.gateway.deps import GatewayDeps, set_deps
 
     cfg, cfg_path = load_config(cli_ctx.config_path)
     deps = GatewayDeps(config=cfg, config_path=cfg_path)

@@ -26,7 +26,7 @@ import typer
 import yaml
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_CONFIG, EXIT_NOT_FOUND
+from openclaw.cli.errors import EXIT_CONFIG, EXIT_NOT_FOUND, CLIError
 
 # 敏感字段名(子串匹配,不区分大小写)
 _SECRET_PATTERNS = ("api_key", "app_secret", "secret_key", "token", "password", "verification_token", "encrypt_key")
@@ -60,15 +60,15 @@ def _read_raw(path: Optional[Path]) -> dict[str, Any]:
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
     if suffix in (".yaml", ".yml"):
-        return yaml.safe_load(text) or {}
+        return (yaml.safe_load(text) or {})  # type: ignore[no-any-return]
     if suffix == ".json":
-        return _json.loads(text) if text.strip() else {}
+        return (_json.loads(text) if text.strip() else {})  # type: ignore[no-any-return]
     if suffix == ".toml":
         try:
             import tomllib  # py3.11+
         except ImportError:
             import tomli as tomllib  # type: ignore[no-redef]
-        return tomllib.loads(text)
+        return tomllib.loads(text)  # type: ignore[no-any-return]
     raise CLIError(f"不支持的配置格式: {suffix}", exit_code=EXIT_CONFIG)
 
 
@@ -76,7 +76,7 @@ def _dump_raw(data: dict[str, Any], path: Path) -> str:
     """按文件后缀序列化。返回文本。"""
     suffix = path.suffix.lower()
     if suffix in (".yaml", ".yml"):
-        return yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        return yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)  # type: ignore[no-any-return]
     if suffix == ".json":
         return _json.dumps(data, ensure_ascii=False, indent=2)
     if suffix == ".toml":
@@ -87,7 +87,7 @@ def _dump_raw(data: dict[str, Any], path: Path) -> str:
                 "TOML 写入需要 tomli-w,请运行: pip install tomli-w",
                 exit_code=EXIT_CONFIG,
             )
-        return tomli_w.dumps(data)
+        return tomli_w.dumps(data)  # type: ignore[no-any-return]
     raise CLIError(f"不支持的配置格式: {suffix}", exit_code=EXIT_CONFIG)
 
 
@@ -278,8 +278,9 @@ def _config_app() -> typer.Typer:
         _deep_set(data, parts, new_val)
 
         # 校验
-        from openclaw.core.config import OpenClawConfig
         from pydantic import ValidationError
+
+        from openclaw.core.config import OpenClawConfig
 
         try:
             OpenClawConfig.model_validate(data)
@@ -307,8 +308,9 @@ def _config_app() -> typer.Typer:
             raise CLIError(f"补丁文件必须是对象/字典,实际: {type(patch).__name__}", exit_code=EXIT_CONFIG)
         _deep_merge(data, patch)
 
-        from openclaw.core.config import OpenClawConfig
         from pydantic import ValidationError
+
+        from openclaw.core.config import OpenClawConfig
 
         try:
             OpenClawConfig.model_validate(data)
@@ -333,8 +335,9 @@ def _config_app() -> typer.Typer:
         parts = _parse_path(key)
         _deep_unset(data, parts)
 
-        from openclaw.core.config import OpenClawConfig
         from pydantic import ValidationError
+
+        from openclaw.core.config import OpenClawConfig
 
         try:
             OpenClawConfig.model_validate(data)
@@ -356,8 +359,9 @@ def _config_app() -> typer.Typer:
             cli_ctx.output.warn(f"配置文件不存在: {path}(将使用默认值)")
             return
         raw = _read_raw(path)
-        from openclaw.core.config import OpenClawConfig
         from pydantic import ValidationError
+
+        from openclaw.core.config import OpenClawConfig
 
         try:
             OpenClawConfig.model_validate(raw)

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import sys
@@ -17,10 +18,12 @@ from typing import Optional
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_CONFIG, EXIT_NOT_FOUND
+from openclaw.cli.errors import EXIT_CONFIG, EXIT_NOT_FOUND, CLIError
 
 # 本地插件目录约定(对齐 core/plugin.py 的 load_local 默认)
 _LOCAL_PLUGINS_DIR = Path("./openclaw_plugins")
+
+logger = logging.getLogger(__name__)
 
 
 def _discover_all(group: Optional[str]) -> list[tuple[str, str, str, str]]:
@@ -33,8 +36,8 @@ def _discover_all(group: Optional[str]) -> list[tuple[str, str, str, str]]:
         try:
             for name, ep in discover_entry_points(g):
                 out.append((g, name, getattr(ep, "value", str(ep)), "entry_point"))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("发现 entry_point 组 %r 失败: %s", g, exc)
     # 本地目录
     if _LOCAL_PLUGINS_DIR.exists():
         for f in sorted(_LOCAL_PLUGINS_DIR.glob("*.py")):

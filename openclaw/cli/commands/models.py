@@ -6,7 +6,6 @@
 """
 from __future__ import annotations
 
-
 import typer
 
 from openclaw.cli.context import get_ctx
@@ -64,7 +63,7 @@ def _models_app() -> typer.Typer:
         if isinstance(llm, ProviderRouter):
             router = llm
             providers = router._providers
-            strategy = router.strategy
+            strategy: str = router.strategy
             primary_name = router.primary.__class__.__name__
         else:
             router = None
@@ -96,6 +95,7 @@ def _models_app() -> typer.Typer:
 
         if ping:
             import asyncio
+
             from openclaw.llm.base import ChatMessage
 
             async def _ping_all() -> None:

@@ -22,8 +22,7 @@ from typing import Any, Optional
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_NOT_FOUND
-
+from openclaw.cli.errors import EXIT_NOT_FOUND, CLIError
 
 # 进程内 run history(最大 100 条,FIFO 淘汰)
 _RUN_HISTORY: list[dict[str, Any]] = []

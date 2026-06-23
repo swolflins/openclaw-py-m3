@@ -158,8 +158,9 @@ def doctor(
         return
 
     if "config" in checks:
-        from openclaw.core.config import OpenClawConfig
         from pydantic import ValidationError
+
+        from openclaw.core.config import OpenClawConfig
         try:
             OpenClawConfig.model_validate(cfg.model_dump())
         except ValidationError as e:

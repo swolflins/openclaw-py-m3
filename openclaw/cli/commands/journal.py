@@ -59,7 +59,7 @@ def _journal_app() -> typer.Typer:
         data = GatewayClient(url, token).get("/v1/journal/soul-proposals")
         proposals = data if isinstance(data, list) else (data.get("proposals", []) if isinstance(data, dict) else [])
         rows = [
-            [p.get("id", "?"), p.get("summary", p.get("content", ""))[:60], p.get("status", "?")]
+            [p.get("id", "?"), p.get("summary", p.get("content", ""))[:60], p.get("status", "?")]  # type: ignore[index]
             for p in proposals if isinstance(p, dict)
         ]
         cli_ctx.output.table(["id", "summary", "status"], rows, title=f"SOUL 提案 ({len(proposals)})")

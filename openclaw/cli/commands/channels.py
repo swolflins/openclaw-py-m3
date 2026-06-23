@@ -12,7 +12,7 @@ from typing import Optional
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_CONFIG, EXIT_NOT_FOUND
+from openclaw.cli.errors import EXIT_CONFIG, EXIT_NOT_FOUND, CLIError
 from openclaw.cli.http import GatewayClient
 
 # 内置 channel 类型(从模块定义收集,不需实例化)
@@ -160,7 +160,12 @@ def _channels_app() -> typer.Typer:
 
 
 def register(app: typer.Typer) -> None:
-    app.add_typer(_channels_app(), name="channels")
+    ch_app = _channels_app()
+    # Phase 34:暴露飞书 WS 显式控制子命令
+    from openclaw.cli.commands import lark_cli
+
+    lark_cli.register(ch_app)
+    app.add_typer(ch_app, name="channels")
 
 
 __all__ = ["register"]

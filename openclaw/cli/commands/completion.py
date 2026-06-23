@@ -16,7 +16,7 @@ from typing import Optional
 
 import typer
 
-from openclaw.cli.errors import CLIError, EXIT_CONFIG, EXIT_UNKNOWN
+from openclaw.cli.errors import EXIT_CONFIG, EXIT_UNKNOWN, CLIError
 
 
 def _detect_shell() -> str:
@@ -35,8 +35,9 @@ def _detect_shell() -> str:
 
 def _generate_completion_script(shell: str) -> str:
     """生成补全脚本文本。失败抛 CLIError。"""
-    from openclaw.cli import app as _app
     from typer.main import get_command
+
+    from openclaw.cli import app as _app
 
     shell = shell.lower()
     if shell == "powershell":
@@ -53,7 +54,7 @@ def _generate_completion_script(shell: str) -> str:
         raise CLIError(f"click 不支持生成 {shell} 补全", exit_code=EXIT_UNKNOWN)
     click_cmd = get_command(_app)
     comp = comp_cls(
-        cli=click_cmd, ctx_args={}, prog_name="openclaw",
+        cli=click_cmd, ctx_args={}, prog_name="openclaw",  # type: ignore[arg-type]
         complete_var="_OPENCLAW_COMPLETE",
     )
     return comp.source()

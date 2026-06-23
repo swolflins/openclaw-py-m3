@@ -260,8 +260,8 @@ def test_serve_missing_dependency(monkeypatch):
     注:CliRunner 直接调 app 不经 main() 的 exit code 转换,
     故此处校验异常对象的 exit_code;生产路径(main)会 sys.exit(3)。
     """
-    from openclaw.cli.errors import CLIError, EXIT_DEPENDENCY
     import openclaw.cli.commands.gateway as gw
+    from openclaw.cli.errors import EXIT_DEPENDENCY, CLIError
 
     def fake_require(extra, modules):
         raise CLIError(

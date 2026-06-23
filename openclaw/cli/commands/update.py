@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -20,7 +21,9 @@ from typing import Optional
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_NETWORK
+from openclaw.cli.errors import EXIT_NETWORK, CLIError
+
+logger = logging.getLogger(__name__)
 
 
 def _get_installed_version() -> Optional[str]:
@@ -29,8 +32,8 @@ def _get_installed_version() -> Optional[str]:
         from importlib.metadata import version
 
         return version("openclaw-py")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("读 importlib.metadata version 失败: %s", exc)
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "pip", "show", "openclaw-py"],
@@ -40,8 +43,8 @@ def _get_installed_version() -> Optional[str]:
             for line in proc.stdout.splitlines():
                 if line.startswith("Version:"):
                     return line.split(":", 1)[1].strip()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("pip show 读取版本失败: %s", exc)
     return None
 
 
@@ -52,7 +55,7 @@ def _get_latest_version() -> Optional[str]:
 
         with urllib.request.urlopen("https://pypi.org/pypi/openclaw-py/json", timeout=5) as r:
             data = json.load(r)
-        return data.get("info", {}).get("version")
+        return str(data.get("info", {}).get("version", "")) or None
     except Exception:  # noqa: BLE001
         return None
 

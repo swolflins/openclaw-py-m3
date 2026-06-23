@@ -49,7 +49,7 @@ def _tools_app() -> typer.Typer:
         try:
             args: dict[str, Any] = json.loads(arguments)
         except json.JSONDecodeError as e:
-            from openclaw.cli.errors import CLIError, EXIT_CONFIG
+            from openclaw.cli.errors import EXIT_CONFIG, CLIError
 
             raise CLIError(f"--args 不是合法 JSON: {e}", exit_code=EXIT_CONFIG) from e
 
@@ -73,7 +73,7 @@ def _tools_app() -> typer.Typer:
             data = GatewayClient(url, token).get("/v1/tools/approver")
         elif action in ("approve", "reject"):
             if not request_id:
-                from openclaw.cli.errors import CLIError, EXIT_CONFIG
+                from openclaw.cli.errors import EXIT_CONFIG, CLIError
 
                 raise CLIError(f"{action} 需要提供 --id", exit_code=EXIT_CONFIG)
             data = GatewayClient(url, token).post(
@@ -81,7 +81,7 @@ def _tools_app() -> typer.Typer:
                 json_body={"request_id": request_id, "decision": action},
             )
         else:
-            from openclaw.cli.errors import CLIError, EXIT_CONFIG
+            from openclaw.cli.errors import EXIT_CONFIG, CLIError
 
             raise CLIError(f"未知操作: {action},支持:status / approve / reject", exit_code=EXIT_CONFIG)
         cli_ctx.output.print(data, title=f"审批: {action}")

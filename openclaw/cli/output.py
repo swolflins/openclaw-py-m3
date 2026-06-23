@@ -84,7 +84,7 @@ class OutputFormatter:
     ) -> None:
         """渲染表格。rows 是行列表,每行长度与 columns 对齐。"""
         if self.mode == "json":
-            data = [dict(zip(columns, row)) for row in rows]
+            data = [dict(zip(columns, row, strict=False)) for row in rows]
             self._emit_json({"rows": data, "count": len(data), **({"title": title} if title else {})})
             return
 

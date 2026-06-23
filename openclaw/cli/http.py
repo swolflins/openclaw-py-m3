@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 import httpx
 
-from openclaw.cli.errors import CLIError, EXIT_NETWORK, EXIT_NOT_FOUND
+from openclaw.cli.errors import EXIT_NETWORK, EXIT_NOT_FOUND, CLIError
 
 
 class GatewayClient:

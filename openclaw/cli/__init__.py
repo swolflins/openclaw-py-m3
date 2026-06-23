@@ -71,8 +71,9 @@ def root(
         from openclaw.core.logging import setup_logging
 
         setup_logging("DEBUG" if verbose else "WARNING", json=json)
-    except Exception:
-        pass  # 日志初始化失败不阻断 CLI
+    except Exception as exc:  # noqa: BLE001
+        # 日志初始化失败不阻断 CLI;仅用 stderr 提示,避免影响 stdout 输出模式
+        print(f"日志初始化失败: {exc}", file=sys.stderr)
 
     ctx.obj = CLIContext(
         output=OutputFormatter(mode, show_secrets=show_secrets),

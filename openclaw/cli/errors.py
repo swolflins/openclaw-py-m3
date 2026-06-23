@@ -1,12 +1,15 @@
 """CLI 统一错误处理。
 
 约定 exit code:
-- 0  成功
-- 1  未知错误
-- 2  配置错误
-- 3  依赖缺失
-- 4  网络错误
-- 5  未找到(not found)
+- 0   成功
+- 1   未知错误
+- 2   配置错误(ConfigError)
+- 3   依赖缺失
+- 4   网络错误
+- 5   未找到(not found)
+- 79  Provider 错误(对齐 sysexits.h 后 CONFIG 子空间)
+- 80  Plugin 错误
+- 81  工具校验错误
 """
 from __future__ import annotations
 
@@ -15,7 +18,6 @@ import sys
 import traceback
 from typing import Optional
 
-
 # exit code 常量
 EXIT_OK = 0
 EXIT_UNKNOWN = 1
@@ -23,6 +25,9 @@ EXIT_CONFIG = 2
 EXIT_DEPENDENCY = 3
 EXIT_NETWORK = 4
 EXIT_NOT_FOUND = 5
+EXIT_PROVIDER = 79
+EXIT_PLUGIN = 80
+EXIT_TOOL_VALIDATION = 81
 
 
 class CLIError(Exception):
@@ -46,14 +51,14 @@ def suggest_commands(typed: str, available: list[str], n: int = 3) -> list[str]:
 def _openclaw_error_exit_code(exc: Exception) -> int:
     """把 openclaw 内部异常族映射到 exit code。"""
     name = type(exc).__name__
-    if name in {"ConfigError"}:
+    if name == "ConfigError":
         return EXIT_CONFIG
-    if name in {"ProviderError"}:
-        return EXIT_CONFIG
-    if name in {"PluginError"}:
-        return EXIT_CONFIG
-    if name in {"ToolValidationError"}:
-        return EXIT_CONFIG
+    if name == "ProviderError":
+        return EXIT_PROVIDER
+    if name == "PluginError":
+        return EXIT_PLUGIN
+    if name == "ToolValidationError":
+        return EXIT_TOOL_VALIDATION
     return EXIT_UNKNOWN
 
 

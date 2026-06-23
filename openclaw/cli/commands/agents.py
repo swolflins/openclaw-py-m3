@@ -13,14 +13,17 @@ agent routing,但本命令组给运营一个可观察的入口。
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_CONFIG, EXIT_NOT_FOUND
+from openclaw.cli.errors import EXIT_CONFIG, EXIT_NOT_FOUND, CLIError
 from openclaw.cli.factory import load_config
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_agents(cfg) -> list[dict]:
@@ -128,7 +131,7 @@ def _agents_app() -> typer.Typer:
         if any(a.get("name") == name for a in agents):
             raise CLIError(f"agent 已存在: {name}", exit_code=EXIT_CONFIG)
 
-        new = {"name": name, "role": role}
+        new: dict[str, Any] = {"name": name, "role": role}
         if model:
             new["model"] = model
         if tools:
@@ -188,7 +191,7 @@ def _agents_app() -> typer.Typer:
                     from openclaw.tools.registry import ToolSpec
 
                     full = next(s for s in loop.tools.list_tools() if s.name == t_name)
-                    sub_registry.register(ToolSpec(
+                    sub_registry.register(ToolSpec(  # type: ignore[arg-type]
                         name=full.name,
                         description=full.description,
                         parameters=full.parameters,
@@ -208,16 +211,16 @@ def _agents_app() -> typer.Typer:
                 try:
                     history = await loop.memory.build_messages(scope, max_messages=10)
                     messages = history + messages
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("agent run 读取 memory 历史失败: %s", exc)
             result = await loop.llm.acomplete(messages, tools=loop.tools.list_tools() if loop.tools else None)
             if loop.memory is not None:
                 try:
                     await loop.memory.append(scope, role="user", content=message)
                     await loop.memory.append(scope, role="assistant", content=result.content)
-                except Exception:  # noqa: BLE001
-                    pass
-            return result.content
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("agent run 写入 memory 失败: %s", exc)
+            return result.content  # type: ignore[no-any-return]
 
         content = asyncio.run(_run())
         cli_ctx.output.print({"agent": name, "session": session, "response": content}, title=f"agent {name} run")

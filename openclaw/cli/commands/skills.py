@@ -15,7 +15,7 @@ from typing import Optional
 import typer
 
 from openclaw.cli.context import get_ctx
-from openclaw.cli.errors import CLIError, EXIT_CONFIG, EXIT_NOT_FOUND
+from openclaw.cli.errors import EXIT_CONFIG, EXIT_NOT_FOUND, CLIError
 from openclaw.cli.factory import load_config
 from openclaw.cli.http import GatewayClient
 

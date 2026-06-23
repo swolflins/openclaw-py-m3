@@ -369,8 +369,8 @@ class TestSessionsExtra:
         # tail 第二次 get 返回空
         c.get.side_effect = [c.get.return_value, {"messages": []}]
         from openclaw.cli import http
-        from openclaw.cli.commands import sessions as sessions_mod
         from openclaw.cli.commands import gateway as gateway_mod
+        from openclaw.cli.commands import sessions as sessions_mod
 
         def _factory(*_a, **_kw):
             return c
