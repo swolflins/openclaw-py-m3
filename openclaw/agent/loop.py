@@ -147,13 +147,24 @@ class Agent:
     async def run(self, user_message: str) -> AgentResponse:
         # 1. 拼装 messages(注入 soul + recall)
         # RT-1: build_messages 已改 async
-        messages = await self.memory.build_messages(
-            self.session_id,
-            user_message,
-            system_prompt=self.system_prompt,
-            history_window=self.history_window,
-            recall_top_k=self.recall_top_k,
-        )
+        if self.memory is None:
+            from openclaw.llm.base import ChatMessage
+            messages = [ChatMessage(role="system", content=self.system_prompt or ""),
+                       ChatMessage(role="user", content=user_message)]
+        else:
+            messages = await self.memory.build_messages(
+                self.session_id,
+                user_message,
+                system_prompt=self.system_prompt,
+                history_window=self.history_window,
+                recall_top_k=self.recall_top_k,
+            )
+        if self.memory is None or not getattr(self.memory, "append_turn", None):
+            async def _noop(*a, **kw): pass
+            self._orig_append_turn = _noop
+        else:
+            self._orig_append_turn = self.memory.append_turn
+
 
         iterations = 0
         all_tool_calls: list[ToolCall] = []
@@ -169,7 +180,9 @@ class Agent:
                 max_chars=self.history_max_chars,
             )
             logger.debug("[agent %s] iter=%d send to LLM, %d msgs", self.session_id, i, len(messages))
-            result = await self.llm.acomplete(messages, tools=self.tools.specs())
+            import os as _os
+            _llm_tools = self.tools.specs() if _os.environ.get("OPENCLAW_DISABLE_TOOLS") != "1" else None
+            result = await self.llm.acomplete(messages, tools=_llm_tools)
 
             if not result.tool_calls:
                 final = AgentResponse(
@@ -178,7 +191,7 @@ class Agent:
                     tool_calls=all_tool_calls,
                     session_id=self.session_id,
                 )
-                await self.memory.append_turn(self.session_id, user_message, final.content)
+                await self._orig_append_turn(self.session_id, user_message, final.content)
                 await self._maybe_journal(user_message, final, tool_results, started_at)
                 return final
 

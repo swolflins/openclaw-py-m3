@@ -83,6 +83,7 @@ def _make_agent():
         from openclaw.providers.anthropic import AnthropicProvider
         from openclaw.providers.gemini import GeminiProvider
         from openclaw.tools.builtin import register_builtin_tools
+        from openclaw.tools.registry import ToolRegistry
 
         backend_cfg = {
             "openai":   ("OpenAI",  OpenAICompatProvider, "gpt-4o-mini", "https://api.openai.com/v1"),
@@ -107,6 +108,8 @@ def _make_agent():
                 api_key=api_key,
                 base_url=os.environ.get("AGENT_BASE_URL", default_url),
                 model=model,
+                timeout=60.0,
+                max_retry_seconds=60.0,
             )
         elif ProviderCls is AnthropicProvider:
             llm = AnthropicProvider(api_key=api_key, model=model)
@@ -116,13 +119,18 @@ def _make_agent():
         # 全链路需要 tools + memory
         fs_root = os.environ.get("OPENCLAW_FS_ROOT", os.getcwd())
         shell_cwd = os.environ.get("OPENCLAW_SHELL_CWD", os.getcwd())
-        tools = register_builtin_tools(fs_root=fs_root, shell_default_cwd=shell_cwd)
+        tools = ToolRegistry()
+        register_builtin_tools(tools, fs_root=fs_root, shell_default_cwd=shell_cwd)
         # 试启动 memory(失败时退回 None,AgentLoop 允许 tools=None/memory=None)
         try:
-            from openclaw.memory import create_memory
-            memory = create_memory(backend=os.environ.get("OPENCLAW_MEMORY", "memory"))
+            from openclaw.memory.scoped import ScopedMemory
+            from openclaw.memory.short_term import ShortTermStore
+            import os as _os2
+            _mem_dir = _os2.environ.get("OPENCLAW_MEMORY_DIR", "/tmp/openclaw_mem")
+            memory = ScopedMemory(short_term=ShortTermStore(_mem_dir))
+            print(f"memory started OK at {_mem_dir}")
         except Exception as e:
-            print(f"⚠️  memory 启动失败,退回 None: {e}", file=sys.stderr)
+            print(f"memory failed: {e}", file=sys.stderr)
             memory = None
 
         agent = AgentLoop(

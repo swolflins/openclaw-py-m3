@@ -43,7 +43,7 @@ COPY openclaw ./openclaw
 
 # 装运行依赖(server + redis + scheduler + fs-watch)
 # ENG-1:不要 --no-deps || true(掩盖真实错误),让 pip 装所有 extras
-RUN pip install --no-cache-dir --no-build-isolation ".[server,redis,scheduler,fs-watch]"
+RUN pip install --no-cache-dir --no-build-isolation ".[server,redis,scheduler,fs-watch,lark]"
 
 # ---------- runtime ----------
 # 同样 digest pin(与 builder 一致)

@@ -694,7 +694,7 @@ class LarkChannel(BaseChannel):
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
                     r = await client.get(
-                        "https://open.feishu.cn/open-apis/im/v1/bots/me",
+                        "https://open.feishu.cn/open-apis/bot/v3/info",
                         headers={"Authorization": f"Bearer {token}"},
                     )
             except Exception as e:
@@ -728,7 +728,7 @@ class LarkChannel(BaseChannel):
 
         def _on_message(data: Any) -> None:
             try:
-                evt = P2ImMessageReceiveV1.model_validate(data)
+                evt = data
                 asyncio.run_coroutine_threadsafe(self._handle_event(evt), loop)
             except Exception:
                 logger.exception("解析飞书事件失败")
