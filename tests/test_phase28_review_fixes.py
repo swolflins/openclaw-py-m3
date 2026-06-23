@@ -195,7 +195,7 @@ class TestDiscordNoDuplicateCheck:
         src = Path(discord.__file__).read_text(encoding="utf-8")
         import re
         start_match = re.search(
-            r"async def start.*?(?=\nasync def |\n    def |\nclass )",
+            r"    async def start.*?(?=\n    async def |\n    def |class )",
             src, re.DOTALL
         )
         assert start_match, "找不到 start() 函数"

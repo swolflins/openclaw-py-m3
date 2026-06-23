@@ -98,17 +98,18 @@ def _models_app() -> typer.Typer:
             import asyncio
             from openclaw.llm.base import ChatMessage
 
-            for p in providers:
-                key = _prov_key(p)
-                try:
-                    asyncio.run(
-                        p.acomplete([ChatMessage(role="user", content="ping")])
-                    )
-                    ping_results.append({"provider": key, "status": "ok"})
-                    cli_ctx.output.success(f"ping {key}: ok")
-                except Exception as e:  # noqa: BLE001
-                    ping_results.append({"provider": key, "status": "fail", "error": str(e)})
-                    cli_ctx.output.warn(f"ping {key}: {e}")
+            async def _ping_all() -> None:
+                for p in providers:
+                    key = _prov_key(p)
+                    try:
+                        await p.acomplete([ChatMessage(role="user", content="ping")])
+                        ping_results.append({"provider": key, "status": "ok"})
+                        cli_ctx.output.success(f"ping {key}: ok")
+                    except Exception as e:  # noqa: BLE001
+                        ping_results.append({"provider": key, "status": "fail", "error": str(e)})
+                        cli_ctx.output.warn(f"ping {key}: {e}")
+
+            asyncio.run(_ping_all())
             cli_ctx.output.print({"ping": ping_results})
 
     return models_app

@@ -65,10 +65,10 @@ async def call_tool(req: ToolCallRequest) -> dict:
         raise HTTPException(503, "agent_loop / tools not attached")
     try:
         result = await reg.call(req.name, req.arguments)
-        m.tool_calls_total.inc(tool=req.name, approved="true")
+        m.tool_calls_total.inc(tool=req.name, approved="true", channel="gateway")
     except PermissionError:
         # 危险工具(EXE/ADMIN)需要审批,会抛 PermissionError
-        m.tool_calls_total.inc(tool=req.name, approved="false")
+        m.tool_calls_total.inc(tool=req.name, approved="false", channel="gateway")
         # SEC-5/SEC-11:不外露原始 exception message(可能含 token / path / 内部信息)
         raise HTTPException(409, "tool approval required or denied") from None
     except KeyError:

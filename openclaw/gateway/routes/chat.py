@@ -105,6 +105,18 @@ class ChatResponse(BaseModel):
     )
 
 
+def _provider_model(loop: Any) -> tuple[str, str]:
+    """从 agent_loop 提取当前 provider 与 model 名称(供 metrics 用)。"""
+    llm = getattr(loop, "llm", None)
+    if llm is None:
+        return ("unknown", "unknown")
+    model = getattr(llm, "model", "unknown")
+    provider = llm.__class__.__name__
+    if hasattr(llm, "primary"):
+        provider = llm.primary.__class__.__name__
+    return (provider, model)
+
+
 # Phase 27 follow-up / M14 修复:把 ``chat`` 和 ``chat_stream`` 共享的
 # 4 步业务(user 存 store → handle → assistant 存 store → count_replies)
 # 抽到 helper ``_process_chat_turn``。两个 endpoint 都调它,行为保持一致,
@@ -164,20 +176,23 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
     t0 = time.time()
     # SEC-12:把 session_id 截到 32 字符,降低 metrics 基数
     sid = (req.session_id or "default")[:32]
-    m.chat_total.inc(session_id=sid)
+    provider, model = _provider_model(loop)
+    m.chat_total.inc(session_id=sid, provider=provider, model=model, channel="gateway")
     request_id = getattr(request.state, "request_id", None) or uuid.uuid4().hex[:12]
     ms = _get_message_store()
     try:
         # Phase 27 follow-up / M14:统一走 _process_chat_turn helper
         user_msg, asst_msg, resp, user_reply_count = await _process_chat_turn(req, loop, ms)
     except Exception as e:
-        m.chat_errors_total.inc(error_type=type(e).__name__)
+        m.chat_errors_total.inc(error_type=type(e).__name__, provider=provider)
         # SEC-11 修复:不暴露 str(e),只给 request_id;完整 trace 写到 server log
         logger.exception(
             "chat_handler_error",
             request_id=request_id,
             session_id=sid,
             error_type=type(e).__name__,
+            provider=provider,
+            model=model,
         )
         raise HTTPException(
             status_code=500,
@@ -188,6 +203,7 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
             },
         )
 
+    m.chat_duration_seconds.observe(time.time() - t0, provider=provider, model=model)
     return ChatResponse(
         session_id=req.session_id,
         content=resp.content or "",
@@ -221,10 +237,15 @@ async def chat_stream(req: ChatRequest, request: Request) -> EventSourceResponse
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     loop_ref = deps.agent_loop
+    # SEC-12:把 session_id 截到 32 字符,降低 metrics 基数
+    sid = (req.session_id or "default")[:32]
+    provider, model = _provider_model(loop_ref)
+    m.chat_total.inc(session_id=sid, provider=provider, model=model, channel="gateway")
     # SEC-12:跟踪 SSE producer task,请求结束时取消 + 防泄漏
     task_ref: dict[str, Optional[asyncio.Task]] = {"task": None}
     # Phase 23:提前拿到 store 引用(避免 producer 里再 import)
     ms = _get_message_store()
+    t0 = time.time()
 
     async def _produce() -> None:
         user_msg_id: Optional[str] = None
@@ -290,11 +311,14 @@ async def chat_stream(req: ChatRequest, request: Request) -> EventSourceResponse
             )
         except Exception as e:
             # SEC-11 修复:不暴露 str(e) 给客户端
+            m.chat_errors_total.inc(error_type=type(e).__name__, provider=provider)
             logger.exception(
                 "chat_stream_error",
                 request_id=request_id,
                 session_id=req.session_id,
                 error_type=type(e).__name__,
+                provider=provider,
+                model=model,
             )
             await queue.put(
                 _sse_format(
@@ -307,6 +331,7 @@ async def chat_stream(req: ChatRequest, request: Request) -> EventSourceResponse
                 )
             )
         finally:
+            m.chat_duration_seconds.observe(time.time() - t0, provider=provider, model=model)
             await queue.put(_sse_format("__end__", {"ok": True}))
 
     task_ref["task"] = asyncio.create_task(_produce())

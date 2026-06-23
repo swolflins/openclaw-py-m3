@@ -240,11 +240,11 @@ class TestJournalPathEscape:
 # H1 — openai_compat aclose 用 shield
 # ============================================================
 class TestOpenAICompatAclose:
-    def test_aclose_uses_shield(self):
-        """aclose 路径应该包含 ``asyncio.shield`` 调用。"""
+    def test_aclose_does_not_use_shield(self):
+        """aclose 路径不应再包含 ``asyncio.shield`` 调用。"""
         from openclaw.providers import openai_compat
         src = Path(openai_compat.__file__).read_text(encoding="utf-8")
-        assert "asyncio.shield" in src
+        assert "asyncio.shield" not in src
 
 
 # ============================================================

@@ -182,7 +182,7 @@ def test_discord_verify_signature_no_key():
     agent = _StubAgent()
     ch = DiscordChannel(token="x", agent_loop=agent)
     # 没设 public_key → 默认放行
-    assert ch.verify_signature(b"body", "sig", "ts") is True
+    assert asyncio.run(ch.verify_signature(b"body", "sig", "ts")) is True
 
 
 # ---------------- Slack ----------------
@@ -245,10 +245,10 @@ def test_slack_verify_signature():
     sig_base = f"v0:{ts}".encode() + body
     expected = "v0=" + hmac.new(secret.encode(), sig_base, hashlib.sha256).hexdigest()
     ch = SlackChannel(token="x", agent_loop=_StubAgent(), signing_secret=secret)
-    assert ch.verify_signature(body, ts, expected) is True
-    assert ch.verify_signature(body, ts, "v0=deadbeef") is False
+    assert asyncio.run(ch.verify_signature(body, ts, expected)) is True
+    assert asyncio.run(ch.verify_signature(body, ts, "v0=deadbeef")) is False
     # 旧时间戳
-    assert ch.verify_signature(body, "1000000000", expected) is False
+    assert asyncio.run(ch.verify_signature(body, "1000000000", expected)) is False
 
 
 def test_slack_url_verification_passes_through():

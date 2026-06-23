@@ -150,7 +150,7 @@ class DiscordChannel(BaseChannel):
 
     # ---------- Webhook 入站 ----------
 
-    def verify_signature(self, body: bytes, signature: str, timestamp: str) -> bool:
+    async def verify_signature(self, body: bytes, signature: str, timestamp: str) -> bool:
         """Discord 出站 webhook 必须验签(Ed25519),简化为可选(pip install nacl)。
 
         **Phase 25 / A2 安全修复(fail-closed)**:
@@ -179,12 +179,17 @@ class DiscordChannel(BaseChannel):
                 "**rejecting** webhook (fail-closed). Install pynacl to verify signatures."
             )
             return False
-        try:
-            vk = VerifyKey(bytes.fromhex(self.public_key))
-            vk.verify(timestamp.encode() + body, bytes.fromhex(signature))
-            return True
-        except Exception:
-            return False
+
+        def _verify() -> bool:
+            try:
+                vk = VerifyKey(bytes.fromhex(self.public_key))
+                vk.verify(timestamp.encode() + body, bytes.fromhex(signature))
+                return True
+            except Exception:
+                return False
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _verify)
 
     async def ingest_webhook(self, payload: dict[str, Any]) -> None:
         """FastAPI/Flask 路由处理函数调用这个:把 Discord POST 进来的事件翻译成 IncomingMessage。"""

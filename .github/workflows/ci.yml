@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +40,11 @@ jobs:
         run: |
           ruff check --ignore S110 --ignore F841 openclaw/ tests/ --statistics --exit-zero || true
           echo "::notice::ruff violations: $(ruff check --ignore S110 --ignore F841 openclaw/ tests/ --statistics --output-format=concise 2>&1 | tail -1 || echo '0')"
+
+      - name: Ruff ASYNC hard-fail
+        # E6 修复:async 阻塞 IO 必须 hard-fail(不再归入 soft)。
+        run: |
+          ruff check --select ASYNC openclaw/ tests/
 
       - name: mypy (strict-ish)
         # ENG-3:静态类型检查;先做非阻塞,逐步收紧

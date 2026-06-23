@@ -142,6 +142,59 @@ class NewSessionRequest(BaseModel):
     session_id: str | None = None
 
 
+class BulkDeleteSessionsRequest(BaseModel):
+    session_ids: list[str]
+
+
+class BulkDeleteMessagesRequest(BaseModel):
+    msg_ids: list[str]
+
+
+@router.delete("")
+async def bulk_delete_sessions(
+    req: BulkDeleteSessionsRequest,
+    request: Request,
+) -> dict:
+    """批量删除 session:清 memory + 清 UI 消息元数据。"""
+    uid = current_user_id(request)
+    short = _short()
+    ms = _message_store()
+    deleted = 0
+    errors: list[str] = []
+    for sid in req.session_ids:
+        if uid != "anonymous" and not sid.startswith(f"{uid}:"):
+            errors.append(f"{sid}: forbidden")
+            continue
+        try:
+            if short is not None and hasattr(short, "clear"):
+                short.clear(sid)
+        except Exception as e:
+            errors.append(f"{sid}: memory clear error: {e}")
+            continue
+        try:
+            await ms.clear_session(sid)
+        except Exception as e:
+            errors.append(f"{sid}: ui clear error: {e}")
+            continue
+        deleted += 1
+    return {"deleted": deleted, "errors": errors}
+
+
+@router.delete("/{session_id}/messages")
+async def bulk_delete_messages(
+    session_id: str,
+    req: BulkDeleteMessagesRequest,
+    request: Request,
+) -> dict:
+    """批量删除某 session 的消息(只删 UI 消息元数据)。"""
+    uid = current_user_id(request)
+    if uid != "anonymous" and not session_id.startswith(f"{uid}:"):
+        raise HTTPException(403, "session does not belong to current user")
+    ms = _message_store()
+    count = await ms.delete_messages(session_id, req.msg_ids)
+    return {"session_id": session_id, "deleted": count}
+
+
 @router.post("")
 async def new_session(req: NewSessionRequest) -> dict:
     deps = get_deps()

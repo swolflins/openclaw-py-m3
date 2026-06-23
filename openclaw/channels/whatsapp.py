@@ -105,7 +105,7 @@ class WhatsAppChannel(BaseChannel):
             return challenge
         return None
 
-    def verify_signature(self, raw_body: bytes, signature_header: str | None) -> bool:
+    async def verify_signature(self, raw_body: bytes, signature_header: str | None) -> bool:
         """C2 修复:校验 Meta 推送的 X-Hub-Signature-256。
 
         签名格式:``sha256=<hex>``,其中 hex = HMAC-SHA256(app_secret, raw_body)。
@@ -123,11 +123,16 @@ class WhatsAppChannel(BaseChannel):
         # Meta 格式:sha256=<hex>
         if not signature_header.startswith("sha256="):
             return False
-        expected = hmac.new(
-            self.app_secret.encode("utf-8"), raw_body, hashlib.sha256
-        ).hexdigest()
-        provided = signature_header[7:]  # 去掉 "sha256=" 前缀
-        return hmac.compare_digest(expected, provided)
+
+        def _verify() -> bool:
+            expected = hmac.new(
+                self.app_secret.encode("utf-8"), raw_body, hashlib.sha256
+            ).hexdigest()
+            provided = signature_header[7:]  # 去掉 "sha256=" 前缀
+            return hmac.compare_digest(expected, provided)
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _verify)
 
     async def ingest_webhook(
         self,
@@ -142,7 +147,7 @@ class WhatsAppChannel(BaseChannel):
         #   - raw_body=None(旧调用方式/测试):若 app_secret 也未配置,记 critical
         #     警告后放行(向后兼容);若 app_secret 已配置则拒绝
         if self.app_secret:
-            if raw_body is None or not self.verify_signature(raw_body, signature):
+            if raw_body is None or not await self.verify_signature(raw_body, signature):
                 logger.warning("whatsapp_webhook_signature_invalid:拒绝未验签的 webhook")
                 return
         else:

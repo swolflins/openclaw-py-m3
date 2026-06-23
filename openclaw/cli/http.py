@@ -79,8 +79,8 @@ class GatewayClient:
     def post(self, path: str, *, json_body: Any = None) -> Any:
         return self._request("POST", path, json_body=json_body)
 
-    def delete(self, path: str) -> Any:
-        return self._request("DELETE", path)
+    def delete(self, path: str, *, json_body: Any = None) -> Any:
+        return self._request("DELETE", path, json_body=json_body)
 
 
 __all__ = ["GatewayClient"]

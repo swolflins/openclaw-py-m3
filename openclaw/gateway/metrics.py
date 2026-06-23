@@ -79,6 +79,56 @@ class _Counter:
             return "\n".join(lines)
 
 
+class _Histogram:
+    """极简 histogram,固定桶(单位秒)。"""
+
+    _DEFAULT_BUCKETS = (
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+        1.0, 2.5, 5.0, 10.0, 30.0, 60.0, float("inf"),
+    )
+
+    def __init__(self, name: str, help_: str, labelnames: tuple = ()) -> None:
+        self.name = name
+        self.help = help_
+        self.labelnames = labelnames
+        self._max_cardinality = 500
+        self._buckets = self._DEFAULT_BUCKETS
+        self._values: Dict[Tuple[str, ...], Dict[float, float]] = defaultdict(
+            lambda: {b: 0.0 for b in self._buckets}
+        )
+        self._sum: Dict[Tuple[str, ...], float] = defaultdict(float)
+        self._count: Dict[Tuple[str, ...], float] = defaultdict(float)
+        self._lock = Lock()
+
+    def observe(self, value: float, **labels: str) -> None:
+        key = tuple(str(labels.get(n, "")) for n in self.labelnames)
+        with self._lock:
+            if len(self._values) >= self._max_cardinality and key not in self._values:
+                key = tuple("__overflow__" if _ else "" for _ in key)
+            buckets = self._values[key]
+            for b in self._buckets:
+                if value <= b:
+                    buckets[b] += 1.0
+            self._sum[key] += value
+            self._count[key] += 1.0
+
+    def render(self) -> str:
+        with self._lock:
+            lines = [f"# HELP {self.name} {self.help}", f"# TYPE {self.name} histogram"]
+            for key, buckets in self._values.items():
+                base_labels: dict[str, str] = {
+                    n: v_ for n, v_ in zip(self.labelnames, key)
+                }
+                for b in self._buckets:
+                    labels = dict(base_labels, le="+Inf" if b == float("inf") else str(b))
+                    label_str = ",".join(f'{n}="{v}"' for n, v in labels.items())
+                    lines.append(f"{self.name}_bucket{{{label_str}}} {buckets[b]}")
+                sum_label_str = ",".join(f'{n}="{v}"' for n, v in base_labels.items())
+                lines.append(f"{self.name}_sum{{{sum_label_str}}} {self._sum[key]}")
+                lines.append(f"{self.name}_count{{{sum_label_str}}} {self._count[key]}")
+            return "\n".join(lines)
+
+
 class _Gauge:
     def __init__(self, name: str, help_: str) -> None:
         self.name = name
@@ -108,18 +158,23 @@ http_requests_total = _Counter(
 )
 chat_total = _Counter(
     "openclaw_chat_total",
-    "Chat 调用总数(按 session_id 分桶,id 截到 32 字符)",
-    labelnames=("session_id",),
+    "Chat 调用总数(按 session_id/provider/model/channel 分桶)",
+    labelnames=("session_id", "provider", "model", "channel"),
 )
 chat_errors_total = _Counter(
     "openclaw_chat_errors_total",
     "Chat 错误总数",
-    labelnames=("error_type",),
+    labelnames=("error_type", "provider"),
+)
+chat_duration_seconds = _Histogram(
+    "openclaw_chat_duration_seconds",
+    "Chat 处理耗时(秒,按 provider/model 分桶)",
+    labelnames=("provider", "model"),
 )
 tool_calls_total = _Counter(
     "openclaw_tool_calls_total",
-    "工具调用总数(按 tool name / approved 分桶)",
-    labelnames=("tool", "approved"),
+    "工具调用总数(按 tool name / approved / channel 分桶)",
+    labelnames=("tool", "approved", "channel"),
 )
 # Phase 27 / M13 修复:网关鉴权失败指标(按 path / has_token 分桶),
 # 便于 SIEM 拉取数据检测暴力破解(同 IP / path 短时间内大量 has_token=false 即报警)
@@ -142,6 +197,7 @@ ALL_METRICS = [
     http_requests_total,
     chat_total,
     chat_errors_total,
+    chat_duration_seconds,
     tool_calls_total,
     gateway_auth_rejected_total,
     uptime_seconds,

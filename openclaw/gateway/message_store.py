@@ -144,6 +144,21 @@ class MessageStore:
                 self._by_id.pop(i, None)
             return len(ids)
 
+    async def delete_messages(self, session_id: str, msg_ids: list[str]) -> int:
+        """批量删除指定 session 中的若干 UI 消息。"""
+        async with self._lock:
+            bucket = self._by_session.get(session_id, [])
+            removed = 0
+            for mid in msg_ids:
+                sm = self._by_id.get(mid)
+                if sm is None or sm.session_id != session_id:
+                    continue
+                self._by_id.pop(mid, None)
+                if mid in bucket:
+                    bucket.remove(mid)
+                removed += 1
+            return removed
+
     def stats(self) -> dict[str, int]:
         return {
             "total_sessions": len(self._by_session),

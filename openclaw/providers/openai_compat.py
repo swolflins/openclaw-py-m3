@@ -79,11 +79,8 @@ class OpenAICompatProvider(BaseLLMProvider):
             return self._client
         # 旧 loop 已销毁,或从未创建 → 重建
         if self._client is not None and not self._client.is_closed:
-            # Phase 27 / H1 修复:用 shield 防止外层 cancel 中断 aclose,避免
-            # 旧 client 半关半开(端口 / fd 泄露)。依然吞任何异常,但记 WARNING
-            # 方便诊断。
             try:
-                await asyncio.shield(self._client.aclose())
+                await self._client.aclose()
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "openai_compat_aclose_failed",

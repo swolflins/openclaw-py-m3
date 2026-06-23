@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import concurrent.futures
 import hmac
 import json
 import logging
@@ -384,6 +385,9 @@ class LarkChannel(BaseChannel):
         self._webhook_rate: dict[str, list[float]] = {}
         # Phase 32:webhook runner 句柄(供 stop() 关闭)
         self._webhook_runner: Optional[Any] = None
+        # Phase 32 / review:线程池 + 媒体缓存垃圾回收
+        self._executor = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="lark_channel")
+        self._gc_task: Optional[asyncio.Task] = None
 
     # ---------- 公共接口 ----------
 
@@ -398,6 +402,10 @@ class LarkChannel(BaseChannel):
             )
         if not self.available:
             raise RuntimeError("飞书凭据未配置 (LARK_APP_ID / LARK_APP_SECRET)")
+
+        # Phase 32 / review:启动媒体文件 GC(实例化时尚未进入事件循环)
+        if self._gc_task is None and self._media_dir is not None:
+            self._gc_task = asyncio.create_task(self._media_gc_loop())
 
         if not self.settings.use_ws:
             # Phase 32:Webhook 模式已落地。
@@ -465,6 +473,49 @@ class LarkChannel(BaseChannel):
                 await asyncio.wait_for(self._task, timeout=3)
             except asyncio.TimeoutError:
                 self._task.cancel()
+        # Phase 32 / review:取消媒体 GC task 并关闭线程池
+        if self._gc_task is not None:
+            self._gc_task.cancel()
+            try:
+                await self._gc_task
+            except asyncio.CancelledError:
+                pass
+            self._gc_task = None
+        if hasattr(self, "_executor") and self._executor is not None:
+            self._executor.shutdown(wait=False)
+        if self._media_dir is not None:
+            try:
+                await asyncio.to_thread(self._run_media_gc_once)
+            except Exception:
+                logger.exception("Lark 退出:媒体 GC 失败")
+
+    async def _media_gc_loop(self) -> None:
+        """每 24 小时清理一次超过 ``LARK_MEDIA_CACHE_TTL_SECONDS`` 的媒体文件。"""
+        while not self._stopped.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stopped.wait(), timeout=24 * 3600,
+                )
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await asyncio.to_thread(self._run_media_gc_once)
+            except Exception:
+                logger.exception("Lark 媒体 GC 失败")
+
+    def _run_media_gc_once(self) -> None:
+        """同步执行媒体目录垃圾回收。"""
+        if not self._media_dir:
+            return
+        now = time.time()
+        cutoff = now - LARK_MEDIA_CACHE_TTL_SECONDS
+        for entry in self._media_dir.iterdir():
+            try:
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+                    logger.debug("Lark 媒体 GC 删除: %s", entry)
+            except Exception:
+                logger.exception("Lark 媒体 GC 删除失败: %s", entry)
 
     async def send(self, session_id: str, text: str) -> None:
         """主动给 session_id 发送消息(默认 reply 原消息)。
@@ -668,7 +719,7 @@ class LarkChannel(BaseChannel):
             )
             tmp.replace(path)
 
-        await loop.run_in_executor(None, _write)
+        await loop.run_in_executor(self._executor, _write)
 
     async def _fetch_bot_open_id(self) -> Optional[str]:
         """CH-1:异步拉一次 bot 自己的 open_id,并缓存到 self._bot_open_id。"""
@@ -782,7 +833,7 @@ class LarkChannel(BaseChannel):
                 log_level=lark.LogLevel.INFO,
             )
             try:
-                await loop.run_in_executor(None, self._ws_client.start)
+                await loop.run_in_executor(self._executor, self._ws_client.start)
                 if self._stopped.is_set():
                     return
                 logger.warning("Lark WS 客户端意外退出,准备重连")
@@ -1093,7 +1144,7 @@ class LarkChannel(BaseChannel):
                     # 流式写 — 文件 IO 走 run_in_executor 避免阻塞事件循环
                     loop = asyncio.get_running_loop()
                     written = await loop.run_in_executor(
-                        None, _stream_to_file_sync, str(target), resp,
+                        self._executor, _stream_to_file_sync, str(target), resp,
                     )
                     if written is None:
                         # 中断(超 LARK_MEDIA_MAX_BYTES)
@@ -1439,7 +1490,7 @@ class LarkChannel(BaseChannel):
                 return client.im.v1.message_reaction.create(request)
 
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, _call)
+            await loop.run_in_executor(self._executor, _call)
         except Exception:
             logger.warning("Lark add reaction %s 失败", emoji_type, exc_info=True)
 
@@ -1464,7 +1515,7 @@ class LarkChannel(BaseChannel):
                 return client.im.v1.message_reaction.delete(request)
 
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, _call)
+            await loop.run_in_executor(self._executor, _call)
         except Exception:
             logger.warning("Lark remove reaction %s 失败", emoji_type, exc_info=True)
 

@@ -99,7 +99,7 @@ class SlackChannel(BaseChannel):
 
     # ---------- Webhook 入站 ----------
 
-    def verify_signature(self, body: bytes, timestamp: str, signature: str) -> bool:
+    async def verify_signature(self, body: bytes, timestamp: str, signature: str) -> bool:
         """Slack signing secret:HMAC-SHA256(secret, 'v0:'+ts+body)。"""
         # M8 修复:无 signing_secret 时 fail-closed(旧逻辑 return True = 放行)
         if not self.signing_secret:
@@ -108,11 +108,20 @@ class SlackChannel(BaseChannel):
                 "任何人可伪造消息。请设置 SLACK_SIGNING_SECRET。"
             )
             return False
-        if abs(time.time() - int(timestamp)) > 300:
+        try:
+            ts = int(timestamp)
+        except (ValueError, TypeError):
             return False
-        sig_base = f"v0:{timestamp}".encode() + body
-        digest = hmac.new(self.signing_secret.encode(), sig_base, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(f"v0={digest}", signature)
+        if abs(time.time() - ts) > 300:
+            return False
+
+        def _verify() -> bool:
+            sig_base = f"v0:{timestamp}".encode() + body
+            digest = hmac.new(self.signing_secret.encode(), sig_base, hashlib.sha256).hexdigest()
+            return hmac.compare_digest(f"v0={digest}", signature)
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _verify)
 
     async def ingest_event(self, payload: dict[str, Any]) -> None:
         """FastAPI/Flask 路由处理函数调用这个。

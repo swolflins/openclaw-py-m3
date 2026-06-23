@@ -195,16 +195,23 @@ def _sessions_app() -> typer.Typer:
             cli_ctx.output.warn(f"无需压缩({len(msgs)} <= {keep})")
             return
         to_delete = msgs[: len(msgs) - keep]
+        msg_ids = [
+            m.get("id") for m in to_delete
+            if isinstance(m, dict) and m.get("id")
+        ]
         deleted = 0
-        for m in to_delete:
-            mid = m.get("id") if isinstance(m, dict) else None
-            if mid is None:
-                continue
+        if msg_ids:
             try:
-                client.delete(f"/v1/sessions/{session_id}/messages/{mid}")
-                deleted += 1
+                resp = client.delete(
+                    f"/v1/sessions/{session_id}/messages",
+                    json_body={"msg_ids": msg_ids},
+                )
+                if isinstance(resp, dict):
+                    deleted = resp.get("deleted", len(msg_ids))
+                else:
+                    deleted = len(msg_ids)
             except CLIError:
-                continue
+                pass
         cli_ctx.output.success(f"已删除 {deleted} 条老消息,保留最近 {keep}")
 
     return s_app

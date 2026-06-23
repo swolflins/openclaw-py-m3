@@ -42,6 +42,13 @@ class ProviderConfig(BaseModel):
     base_url: Optional[str] = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
+    def redact_json(self) -> dict[str, Any]:
+        """返回脱敏后的 dict,api_key 被替换为 ``***``。"""
+        data = self.model_dump(mode="json")
+        if self.api_key is not None:
+            data["api_key"] = "***"
+        return data
+
 
 class ChannelConfig(BaseModel):
     name: str  # cli / lark / telegram / ...
@@ -151,6 +158,16 @@ class ChannelRuntimeConfig(BaseModel):
     fs_root: str = Field(default_factory=lambda: str(Path("~/.openclaw/channels").expanduser()))
 
 
+class CronConfig(BaseModel):
+    """Phase 27+ review:cron 命令可配置项。"""
+    interpreter_blacklist: list[str] = Field(default_factory=lambda: [
+        "python", "python3", "python2", "sh", "bash", "zsh",
+        "perl", "ruby", "node", "nodejs", "lua", "php",
+    ])
+    default_timeout_seconds: int = 60
+    max_timeout_seconds: int = 3600
+
+
 class AgentConfig(BaseModel):
     system_prompt: str = "你叫 Claw,是一个乐于助人、简洁高效的私人 AI 助理。"
     max_tool_iterations: int = 8
@@ -196,6 +213,8 @@ class OpenClawConfig(BaseModel):
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     # ----- Phase 7 -----
     channels_runtime: ChannelRuntimeConfig = Field(default_factory=ChannelRuntimeConfig)
+    # ----- Phase 27+ review -----
+    cron: CronConfig = Field(default_factory=CronConfig)
 
     # ----- Phase 26:多 agent 配置(list[dict] 由 CLI 写/读) -----
     agents: list[dict] = Field(default_factory=list)

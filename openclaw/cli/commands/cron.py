@@ -40,7 +40,26 @@ _INTERPRETER_BLACKLIST = {
 _MAX_COMMAND_LEN = 4096  # 长度上限防 OOM / log 注入
 
 
-def _validate_command(command: str) -> list[str]:
+def _cron_config(config_path: str | None = None) -> "CronConfig":
+    """加载 OpenClawConfig 并返回 cron 子配置(不存在则默认)。"""
+    try:
+        from openclaw.cli.factory import load_config
+        from openclaw.core.config import OpenClawConfig
+
+        if config_path:
+            cfg, _ = load_config(config_path)
+            return cfg.cron
+        return OpenClawConfig().cron
+    except Exception:
+        # 配置加载失败时仍返回安全默认值,不阻断 cron 管理
+        from openclaw.core.config import CronConfig
+        return CronConfig()
+
+
+def _validate_command(
+    command: str,
+    interpreter_blacklist: Optional[set[str]] = None,
+) -> list[str]:
     """校验 + 分词,失败抛 CLIError(CONFIG=2);返回 shlex 分词后的 argv 列表。
 
     行为:
@@ -52,6 +71,8 @@ def _validate_command(command: str) -> list[str]:
     """
     import shlex
     import sys
+
+    blacklist = interpreter_blacklist if interpreter_blacklist is not None else _INTERPRETER_BLACKLIST
 
     if not command or not command.strip():
         raise CLIError("command 为空", exit_code=2)
@@ -84,7 +105,7 @@ def _validate_command(command: str) -> list[str]:
         raise CLIError("command 解析后为空", exit_code=2)
     import os
     first_tok = os.path.basename(args[0])
-    if first_tok.lower() in _INTERPRETER_BLACKLIST:
+    if first_tok.lower() in {tok.lower() for tok in blacklist}:
         raise CLIError(
             f"解释器 {first_tok!r} 不允许(可经 -c/-e 注入任意代码;"
             f"请用编译后的脚本路径)",
@@ -137,6 +158,7 @@ def _cron_app() -> typer.Typer:
         expr: str = typer.Option(..., "--expr", "-e", help="cron 表达式,如 '*/5 * * * *'"),
         command: str = typer.Option(..., "--command", "-c", help="要执行的命令(已 shlex 分词,无 shell 解释)"),
         name: Optional[str] = typer.Option(None, "--name", help="任务名(备注)"),
+        timeout: Optional[int] = typer.Option(None, "--timeout", help="单次执行超时秒数(默认走 cron 配置)"),
     ) -> None:
         """添加 cron 任务(执行命令)。
 
@@ -147,21 +169,29 @@ def _cron_app() -> typer.Typer:
         """
         cli_ctx = get_ctx(ctx.obj)
         mgr = _mgr()
+        cron_cfg = _cron_config(cli_ctx.config_path)
         # 校验并分词;失败抛 CLIError(2)
-        argv = _validate_command(command)
+        argv = _validate_command(command, interpreter_blacklist=set(cron_cfg.interpreter_blacklist))
+
+        run_timeout = timeout if timeout is not None else cron_cfg.default_timeout_seconds
+        if run_timeout > cron_cfg.max_timeout_seconds:
+            raise CLIError(
+                f"timeout {run_timeout}s 超过配置上限 {cron_cfg.max_timeout_seconds}s",
+                exit_code=2,
+            )
 
         def _run():
             try:
                 # SEC-3 / Phase 27 / C3:shell=False + argv 列表,杜绝 shell 注入
                 proc = subprocess.run(
-                    argv, shell=False, capture_output=True, text=True, timeout=60,
+                    argv, shell=False, capture_output=True, text=True, timeout=run_timeout,
                 )
                 _record_run(jid, "ok" if proc.returncode == 0 else "fail", proc.stdout + proc.stderr)
             except subprocess.TimeoutExpired:
-                _record_run(jid, "timeout", "command timed out (60s)")
+                _record_run(jid, "timeout", f"command timed out ({run_timeout}s)")
 
         jid = mgr.add_cron(expr, _run)
-        cli_ctx.output.success(f"已添加 cron 任务: {jid} (expr={expr})")
+        cli_ctx.output.success(f"已添加 cron 任务: {jid} (expr={expr}, timeout={run_timeout}s)")
 
     @cr_app.command("show")
     def cron_show(
