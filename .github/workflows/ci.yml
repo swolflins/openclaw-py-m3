@@ -41,14 +41,9 @@ jobs:
           ruff check --ignore S110 --ignore F841 openclaw/ tests/ --statistics --exit-zero || true
           echo "::notice::ruff violations: $(ruff check --ignore S110 --ignore F841 openclaw/ tests/ --statistics --output-format=concise 2>&1 | tail -1 || echo '0')"
       - name: Ruff ASYNC hard-fail
-        # E6 修复:ASYNC rule 必须 0 错,挡 merge
-        run: |
-          ruff check openclaw/ --select ASYNC --statistics
-
-      - name: Ruff ASYNC hard-fail
         # E6 修复:async 阻塞 IO 必须 hard-fail(不再归入 soft)。
         run: |
-          ruff check --select ASYNC openclaw/ tests/
+          ruff check --select ASYNC openclaw/ tests/ --statistics
 
       - name: mypy (strict-ish)
         # ENG-3:静态类型检查;先做非阻塞,逐步收紧
