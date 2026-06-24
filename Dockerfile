@@ -52,6 +52,8 @@ RUN pip install --no-cache-dir ".[server,redis,scheduler,fs-watch,lark]"
 # 同样使用标签(与 builder 一致);TODO 恢复 digest pin
 FROM python:3.11-slim AS runtime
 
+# Phase 34:Docker 镜像默认开启 dev 模式,让 smoke test / 本地开箱即用。
+# 生产部署必须显式设置 OPENCLAW_GATEWAY_TOKEN 并覆盖/删除此变量。
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONFAULTHANDLER=1 \
@@ -59,7 +61,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OPENCLAW_CONFIG=/data/openclaw.yaml \
     OPENCLAW_LOG_LEVEL=INFO \
     OPENCLAW_GATEWAY_HOST=0.0.0.0 \
-    OPENCLAW_GATEWAY_PORT=8080
+    OPENCLAW_GATEWAY_PORT=8080 \
+    OPENCLAW_GATEWAY_DEV=1
 
 # tini:信号转发(Ctrl-C / SIGTERM)
 RUN apt-get update && apt-get install -y --no-install-recommends tini curl \

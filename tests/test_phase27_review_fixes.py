@@ -288,12 +288,15 @@ class TestAgentHandleExceptionSafety:
 
         loop = AgentLoop(llm=llm, tools=tools, memory=memory, handle_timeout=5.0)
 
-        # 替换 _get_agent,返回一个会抛错的 mock
+        # 替换 aget_agent,返回一个会抛错的 Agent
         class BadAgent:
             async def run(self, msg):
                 raise RuntimeError("internal LLM provider is down: 192.168.0.1:443")
 
-        loop._get_agent = MagicMock(return_value=BadAgent())
+        async def mock_aget_agent(session_id: str):
+            return BadAgent()
+
+        loop.aget_agent = mock_aget_agent
         resp = await loop.handle("s1", "hi")
         assert isinstance(resp, AgentResponse)
         assert resp.error_type == "RuntimeError"
@@ -316,7 +319,10 @@ class TestAgentHandleExceptionSafety:
                 await asyncio.sleep(1.0)
                 return None
 
-        loop._get_agent = MagicMock(return_value=SlowAgent())
+        async def mock_aget_agent(session_id: str):
+            return SlowAgent()
+
+        loop.aget_agent = mock_aget_agent
         with pytest.raises(asyncio.TimeoutError):
             await loop.handle("s1", "hi")
 

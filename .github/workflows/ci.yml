@@ -183,9 +183,22 @@ jobs:
 
       - name: Smoke (image runs /healthz)
         run: |
+          set -u
+          cleanup() {
+            echo "::group::container logs"
+            docker logs openclaw-ci || true
+            echo "::endgroup::"
+            docker stop openclaw-ci || true
+          }
+          trap cleanup EXIT
           docker run -d --rm --name openclaw-ci -p 18080:8080 \
             ghcr.io/${{ github.repository_owner }}/openclaw-py:dev
-          sleep 8
-          curl -fsS http://127.0.0.1:18080/healthz | tee /tmp/health.json
+          # 轮询等待服务就绪(最多 30s),避免启动慢导致偶发失败
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz -o /tmp/health.json 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          cat /tmp/health.json
           test "$(jq -r .status /tmp/health.json)" = "ok"
-          docker stop openclaw-ci

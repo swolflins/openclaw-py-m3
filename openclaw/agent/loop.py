@@ -443,8 +443,12 @@ class AgentLoop:
         串直接抛到调用方;只抛 ``AgentResponse(content="...", error_type=...)`` 或
         重新抛 ``asyncio.TimeoutError`` / ``ValueError``。``RuntimeError`` 这类
         业务级错误依然透传(由调用方负责显示/记录)。
+
+        Phase 34 修复:用 ``aget_agent`` 替代同步 ``_get_agent``,避免在 async handle
+        里拿 ``threading.RLock`` 阻塞事件循环,同时消除并发请求同一 session_id 时
+        重复创建 Agent 的竞态。
         """
-        agent = self._get_agent(session_id)
+        agent = await self.aget_agent(session_id)
         try:
             return await asyncio.wait_for(agent.run(user_message), timeout=self._handle_timeout)
         except asyncio.TimeoutError:
@@ -480,5 +484,5 @@ class AgentLoop:
 
     async def new_session(self, session_id: str | None = None) -> str:
         sid = session_id or f"sess_{uuid.uuid4().hex[:12]}"
-        self._get_agent(sid)
+        await self.aget_agent(sid)
         return sid
