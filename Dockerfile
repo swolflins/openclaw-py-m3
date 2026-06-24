@@ -42,9 +42,11 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY openclaw ./openclaw
 
-# 装运行依赖(server + redis + scheduler + fs-watch)
+# 升级 pip / wheel / setuptools,避免旧版构建后端导致 sdist 编译失败
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools
+# 装运行依赖(server + redis + scheduler + fs-watch + lark)
 # ENG-1:不要 --no-deps || true(掩盖真实错误),让 pip 装所有 extras
-RUN pip install --no-cache-dir --no-build-isolation ".[server,redis,scheduler,fs-watch,lark]"
+RUN pip install --no-cache-dir ".[server,redis,scheduler,fs-watch,lark]"
 
 # ---------- runtime ----------
 # 同样使用标签(与 builder 一致);TODO 恢复 digest pin
