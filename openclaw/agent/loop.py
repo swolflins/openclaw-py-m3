@@ -148,7 +148,6 @@ class Agent:
         # 1. 拼装 messages(注入 soul + recall)
         # RT-1: build_messages 已改 async
         if self.memory is None:
-            from openclaw.llm.base import ChatMessage
             messages = [ChatMessage(role="system", content=self.system_prompt or ""),
                        ChatMessage(role="user", content=user_message)]
         else:

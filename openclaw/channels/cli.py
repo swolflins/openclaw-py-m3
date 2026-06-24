@@ -12,17 +12,19 @@ class CLIChannel(BaseChannel):
 
     - 每行输入是一条用户消息
     - 输入 :exit / :quit 退出
+    - 支持固定 session_id,让多轮对话共享同一份 memory 上下文
     """
 
     name = "cli"
 
-    def __init__(self, agent_loop: AgentLoop) -> None:
+    def __init__(self, agent_loop: AgentLoop, session_id: str = "cli") -> None:
         super().__init__(agent_loop)
+        self.session_id = session_id
         self._stopped = asyncio.Event()
         self._task: asyncio.Task | None = None
 
     async def start(self) -> None:
-        print("=== OpenClaw CLI ===")
+        print(f"=== OpenClaw CLI (session: {self.session_id}) ===")
         print("输入你的问题,回车发送。:exit 退出。")
         self._task = asyncio.create_task(self._run())
         await self._stopped.wait()
@@ -48,10 +50,10 @@ class CLIChannel(BaseChannel):
                     continue
                 if line in (":exit", ":quit"):
                     break
-                # 走统一管道
+                # 走统一管道,使用固定 session_id 保持多轮上下文
                 await self.dispatch(IncomingMessage(
                     channel=self.name,
-                    session_id="cli",
+                    session_id=self.session_id,
                     user_id="local",
                     text=line,
                     metadata={"is_dm": True},

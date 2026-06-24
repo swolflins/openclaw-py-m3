@@ -20,14 +20,14 @@
 - 用 ``atexit.register(client.stop)`` 兜底关闭 AsyncClient, 避免脚本退出时漏
   关闭导致 ResourceWarning / 连接泄漏。
 """
-import os
-import sys
+import asyncio
 import atexit
 import json
+import os
 import re
-import time
-import asyncio
+import sys
 import threading
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -91,6 +91,7 @@ sys.path.insert(0, str(project_root))
 
 # 加载环境变量
 from dotenv import load_dotenv
+
 load_dotenv(project_root / ".env")
 
 import httpx
@@ -205,6 +206,8 @@ def _stop_async_worker() -> None:
     global _async_client
     if _async_loop is None or _async_client is None:
         return
+    if _async_loop.is_closed():
+        return
     try:
         # 在 worker loop 上调 aclose() 干净释放连接池
         fut = asyncio.run_coroutine_threadsafe(_async_client.aclose(), _async_loop)
@@ -216,7 +219,8 @@ def _stop_async_worker() -> None:
         logger.exception("start_lark_sync: stop 失败")
     finally:
         try:
-            _async_loop.call_soon_threadsafe(_async_loop.stop)
+            if not _async_loop.is_closed():
+                _async_loop.call_soon_threadsafe(_async_loop.stop)
         except Exception:
             pass
 

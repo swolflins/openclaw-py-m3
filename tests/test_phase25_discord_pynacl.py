@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -117,7 +118,7 @@ def test_pynacl_missing_valid_sig_rejects(monkeypatch):
     # 给一个"看起来合法"的 sig + timestamp(64 hex chars)
     # M8 修复:verify_signature 现在校验 timestamp 新鲜度(±300s),用当前时间
     import time as _time
-    result = ch.verify_signature(b'{"type":2}', "a" * 128, str(int(_time.time())))
+    result = asyncio.run(ch.verify_signature(b'{"type":2}', "a" * 128, str(int(_time.time()))))
     assert result is False, (
         f"FAIL-OPEN 回归! pynacl 缺失时 verify_signature 返 {result!r} "
         f"(应返 False 触发 400)。"
@@ -184,7 +185,7 @@ def test_pynacl_available_valid_sig_accepts():
     import time as _time
     ts = str(int(_time.time()))
     sig = _sign(priv_hex, ts.encode() + body)
-    assert ch.verify_signature(body, sig, ts) is True
+    assert asyncio.run(ch.verify_signature(body, sig, ts)) is True
 
 
 def test_pynacl_available_invalid_sig_rejects():
@@ -204,9 +205,9 @@ def test_pynacl_available_invalid_sig_rejects():
     ts = str(int(_time.time()))
     other_priv, _ = _gen_ed25519_keypair()
     bad_sig = _sign(other_priv, ts.encode() + body)
-    assert ch.verify_signature(body, bad_sig, ts) is False
+    assert asyncio.run(ch.verify_signature(body, bad_sig, ts)) is False
     # 长度异常的 hex
-    assert ch.verify_signature(body, "not_hex_!!", ts) is False
+    assert asyncio.run(ch.verify_signature(body, "not_hex_!!", ts)) is False
 
 
 # ─────── 边界 / 回归测试 ───────
@@ -229,7 +230,7 @@ def test_pynacl_missing_dev_mode_no_raise(monkeypatch):
         public_key="0" * 64,
     )
     # 但 verify_signature 仍应 fail-closed
-    assert ch.verify_signature(b"x", "a" * 128, "1") is False
+    assert asyncio.run(ch.verify_signature(b"x", "a" * 128, "1")) is False
 
 
 def test_pynacl_missing_no_public_key_keeps_open(monkeypatch):
@@ -238,7 +239,7 @@ def test_pynacl_missing_no_public_key_keeps_open(monkeypatch):
 
     monkeypatch.setattr(dmod, "_has_pynacl", lambda: False)
     ch = dmod.DiscordChannel(token="x", agent_loop=_make_fake_agent(), public_key=None)
-    assert ch.verify_signature(b"any-body", "any-sig", "any-ts") is True
+    assert asyncio.run(ch.verify_signature(b"any-body", "any-sig", "any-ts")) is True
 
 
 def test_prod_mode_alt_env_var_also_works(monkeypatch):

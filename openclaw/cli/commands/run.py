@@ -20,8 +20,7 @@ def _run_repl(loop, session_id: str) -> None:
     """启动 CLIChannel REPL。"""
     from openclaw.channels.cli import CLIChannel
 
-    channel = CLIChannel(loop)
-    # 注入 session_id(供 send 显示)
+    channel = CLIChannel(loop, session_id=session_id)
     try:
         asyncio.run(channel.start())
     except KeyboardInterrupt:

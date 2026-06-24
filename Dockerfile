@@ -23,7 +23,8 @@
 #   2) docker images --digests | grep python | grep 3.11-slim
 #   3) 把 sha256:... 粘到下面
 # 文档见 docs/deployment.md 6.1 节。
-FROM python:3.11-slim@sha256:5be6a4b5b3adf1fd42f40d52efe85f9b3c3b3b8a13f5b3b3a0c5c5b3a3b3a3b AS builder
+# TODO: 恢复 digest pin 以增强可重现性;当前用标签绕过 CI 中无效 digest。
+FROM python:3.11-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -46,8 +47,8 @@ COPY openclaw ./openclaw
 RUN pip install --no-cache-dir --no-build-isolation ".[server,redis,scheduler,fs-watch,lark]"
 
 # ---------- runtime ----------
-# 同样 digest pin(与 builder 一致)
-FROM python:3.11-slim@sha256:5be6a4b5b3adf1fd42f40d52efe85f9b3c3b3b8a13f5b3b3a0c5c5b3a3b3a3b AS runtime
+# 同样使用标签(与 builder 一致);TODO 恢复 digest pin
+FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
