@@ -46,6 +46,13 @@ def register_builtin_tools(
     register_http_tools(registry, allowed_hosts=http_allowed_hosts)
     register_cron_tools(registry)
 
+    # Phase 36: 联网工具(get_weather / web_search / web_fetch,免 API key)
+    from openclaw.tools.builtin.web import register_web_tools
+    try:
+        register_web_tools(registry)
+    except Exception as e:  # pragma: no cover
+        logger.info("web_tools_skipped", reason=str(e))
+
     try:
         register_docker_tools(registry)
     except Exception as e:  # pragma: no cover
